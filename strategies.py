@@ -25,11 +25,11 @@ class SimpleQueryStrategyType(enum.Enum):
     }
     REVERSE_STR_MAPPINGS = {v: k for k, v in STR_MAPPINGS.items()}
 
-    def strategy_to_str(self) -> str:
+    def to_str(self) -> str:
         return self.STR_MAPPINGS[self]
     
     @classmethod
-    def str_to_strategy(cls: 'SimpleQueryStrategyType', strategy_str: str) -> 'SimpleQueryStrategyType':
+    def from_str(cls: 'SimpleQueryStrategyType', strategy_str: str) -> 'SimpleQueryStrategyType':
         return cls.REVERSE_STR_MAPPINGS[strategy_str]
         
 class QueryStrategySimple(QueryStrategyType):
@@ -41,7 +41,7 @@ class QueryStrategySimple(QueryStrategyType):
         return {}
     
     def query_strategy_name(self) -> str:
-        return self.__strategy.strategy_to_str()
+        return self.__strategy.to_str()
 
 
 @dataclasses.dataclass

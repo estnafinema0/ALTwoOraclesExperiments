@@ -272,10 +272,10 @@ Initial labeled: 200
 
 `macro-F1` практически совпадает с `accuracy`.  
 
-![Динамика accuracy при Random Sampling](data/sst2_random_acc.png)
+![Динамика accuracy при Random Sampling](images_diary/sst2_random_acc.png)
 Рисунок 1. Динамика accuracy при Random Sampling
 
-![alt text](data/sst2_random_money.png)
+![alt text](images_diary/sst2_random_money.png)
 Рисунок 2. Accuracy от стоимости разметки при Random Sampling
 
 ### 3.1.2 SST-2, стратегия Least Confidence (Uncertainty Sampling) (17min)
@@ -302,10 +302,10 @@ Initial labeled: 200
 [Iter 10] labeled=2200 | acc=0.8796 | macro_f1=0.8795 | cost_human=11000.0
 ```
 
-![alt](data/sst2_lc_acc.png)
+![alt](images_diary/sst2_lc_acc.png)
 Рисунок 1. Динамика accuracy при Least Confidence
 
-![alt text](data/sst2_lc_money.png)
+![alt text](images_diary/sst2_lc_money.png)
 Рисунок 2. Accuracy от стоимости разметки при Least Confidence
 
 ### 3.1.3 SST-2, стратегия BALD (MC Dropout) (7min)
@@ -364,10 +364,10 @@ History saved to:
   /content/drive/MyDrive/al_two_oracles/logs/sst2_bald_history.csv
 ```
 
-![alt](data/sst2_bald_acc.png)
+![alt](images_diary/sst2_bald_acc.png)
 Рисунок 1. Динамика accuracy при BALD
 
-![alt text](data/sst2_bald_money.png)
+![alt text](images_diary/sst2_bald_money.png)
 Рисунок 2. Accuracy от стоимости разметки при BALD
 
 В стратегии BALD видим самый слабый старт по метрике accuracy b F1-score.
@@ -378,15 +378,15 @@ History saved to:
 несовместимость между реализацией DistilBertForSequenceClassification (библиотека
 `transformers`) и реализацией BADGE в библиотеке `small-text`. Проблема разрешена.
 
-![alt](data/sst2_badge_acc.png)
+![alt](images_diary/sst2_badge_acc.png)
 Рисунок 1. Динамика accuracy при BADGE
 
-![alt text](data/sst2_badge_money.png)
+![alt text](images_diary/sst2_badge_money.png)
 Рисунок 2. Accuracy от стоимости разметки при BADGE
 
 ### 3.5 Сводная таблица
 
-![alt text](data/SST2_Accuracy_vs_Number_of_Labeled_Samples.png)
+![alt text](images_diary/SST2_Accuracy_vs_Number_of_Labeled_Samples.png)
 
 Ниже сведены результаты четырёх стратегий: Random, Least Confidence (LC), BALD и BADGE на точках обучающего набора: 200, 400, 600, 800 и 2200 размеченных примеров.
 
@@ -441,10 +441,10 @@ Initial labeled: 200
 
 Кривая качества в целом монотонно растёт, небольшое падение на последней итерации можно считать флуктуацией обучения.
 
-![alt](data/ag_news_random_acc.png)
+![alt](images_diary/ag_news_random_acc.png)
 Рисунок 3. Динамика accuracy при Random Sampling на AG News
 
-![alt](data/ag_news_random_money.png)
+![alt](images_diary/ag_news_random_money.png)
 Рисунок 4. Accuracy от стоимости разметки при Random Sampling на AG News
 
 ---
@@ -478,10 +478,10 @@ History saved to:
 
 Видно небольшой локальный спад на 600 примерах, но дальше LC уверенно выходит в лидеры и даёт лучшее финальное качество среди всех стратегий (~0.911 accuracy и macro-F1).
 
-![alt](data/ag_news_lc_acc.png)
+![alt](images_diary/ag_news_lc_acc.png)
 Рисунок 5. Динамика accuracy при Least Confidence на AG News
 
-![alt](data/ag_news_lc_money.png)
+![alt](images_diary/ag_news_lc_money.png)
 Рисунок 6. Accuracy от стоимости разметки при Least Confidence на AG News
 
 ---
@@ -509,10 +509,10 @@ Initial labeled: 200
 
 Финальное качество BALD немного уступает LC, но заметно превосходит Random. Небольшие флуктуации на поздних итерациях (1600–2000 примеров) выглядят как нормальная вариативность стохастического обучения и MC Dropout.
 
-![alt](data/ag_news_bald_acc.png)
+![alt](images_diary/ag_news_bald_acc.png)
 Рисунок 7. Динамика accuracy при BALD на AG News
 
-![alt](data/ag_news_bald_money.png)
+![alt](images_diary/ag_news_bald_money.png)
 Рисунок 8. Accuracy от стоимости разметки при BALD на AG News
 
 ---
@@ -540,10 +540,10 @@ Initial labeled: 200
 
 Кривая BADGE очень гладкая и монотонная, с небольшими колебаниями в районе 1600–2000 примеров. Итоговое качество (~0.901) чуть ниже, чем у LC и BALD, но выше Random.
 
-![alt](data/ag_news_badge_acc.png)
+![alt](images_diary/ag_news_badge_acc.png)
 Рисунок 9. Динамика accuracy при BADGE на AG News
 
-![alt](data/ag_news_badge_money.png)
+![alt](images_diary/ag_news_badge_money.png)
 Рисунок 10. Accuracy от стоимости разметки при BADGE на AG News
 
 ---
@@ -551,7 +551,7 @@ Initial labeled: 200
 ### 3.2.5 Короткие выводы по AG News
 
 
-![alt text](data/ag_news_Accuracy_vs_Number_of_Labeled_Samples.png)
+![alt text](images_diary/ag_news_Accuracy_vs_Number_of_Labeled_Samples.png)
 
 1. **Все стратегии стартуют с высоким качеством (≈0.83–0.84 на 200 примерах)**, что отражает сравнительную простоту датасета AG News для DistilBERT: даже небольшой объём разметки даёт хорошую генерализацию.
 2. **Least Confidence вновь показывает лучший финальный результат** (~0.91 accuracy / macro-F1), стабильно опережая Random и немного опережая BALD/BADGE.
