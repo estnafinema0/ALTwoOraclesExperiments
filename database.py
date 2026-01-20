@@ -1,9 +1,11 @@
-import dataclasses
-from strategies import ActiveLearningStrategy, ColdStartStrategy
+from transformers.models.bert.tokenization_bert_fast import BertTokenizerFast
+from small_text.integrations.transformers.datasets import TransformersDataset
 import datasets
-import enum
 import numpy as np
 import numpy.typing as npt
+
+import dataclasses
+import enum
 import os
 import json
 
@@ -73,8 +75,10 @@ class LLMLabels:
         return f"{ID}_{llm.to_str()}"
 
 class Dataset:
-    def __init__(self, id: DatasetID, root_dir: str | None = None):
+    def __init__(self, id: DatasetID, text_field: str, label_field: str, root_dir: str | None = None):
         self.id = id
+        self.text_field = text_field
+        self.label_field = label_field
         self.__dataset = None
         self.__annotations = None
         self.root_dir = root_dir if root_dir is not None else os.getcwd()
@@ -103,7 +107,7 @@ class Dataset:
                     llm = LLMType.from_str(llm_str)
                     self.__annotations[llm] = LLMLabels.load(self.root_dir, label_file)
         return self.__annotations
-    
+
     @property
     def dataset(self) -> datasets.Dataset:
         if self.__dataset is None:
@@ -111,48 +115,105 @@ class Dataset:
                 self.__dataset = datasets.load_dataset(self.id.path, trust_remote_code=True)
             else:
                 self.__dataset = datasets.load_dataset(self.id.path, self.id.subset, trust_remote_code=True)
+            self.__dataset = Dataset.__standardize_dataset(self.__dataset, self.text_field, self.label_field)
         return self.__dataset
     
     def __repr__(self):
         return f"Dataset(path={self.id.path}, subset={self.id.subset})"
 
- 
-
-def subsample_pool(hf_train_split: Dataset, pool_size: int, seed: int):
-    """Сэмплируем pool_size из train."""
-    n = len(hf_train_split)
-    pool_size = min(pool_size, n)
-    rng = np.random.default_rng(seed)
-    indices = np.arange(n)
-    rng.shuffle(indices)
-    selected = indices[:pool_size]
-    return hf_train_split.select(selected.tolist()), selected
+    @staticmethod
+    def __standardize_dataset(dataset: datasets.Dataset, text_field: str, label_field: str):
+        return dataset.map(
+            lambda ex: {
+                "text": ex[text_field],
+                "label": ex[label_field],
+            },
+            remove_columns=dataset["train"].column_names,
+        )
+    
+    @property
+    def train(self) -> datasets.Dataset:
+        return self.dataset["train"]
+    
+    @property
+    def validation(self) -> datasets.Dataset:
+        return self.dataset.get("validation", self.dataset["test"])
 
 class Indices:
-    ...
+    def __init__(self, indices: npt.NDArray[np.int64], repr: dict[str, any] | None):
+        self.indices = indices
+        self.repr = repr
+
+    @property
+    def size(self) -> int:
+        return len(self.indices)
+    
+    @staticmethod
+    def from_seed(*, size: int, seed: int, dataset_size: int) -> 'Indices':
+        rng = np.random.default_rng(seed)
+        indices = np.arange(dataset_size)
+        rng.shuffle(indices)
+        return Indices(indices=indices[:size], repr={"seed": seed, "size": size, "dataset_size": dataset_size})
+
+    def dump(self, root_dir: os.PathLike, file_name: str):
+        config = {
+            'hardcoded': self.repr is None, 
+        }
+        if self.repr is not None:
+            config['repr'] = self.repr
+        else:
+            indices_file =  os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.dat") 
+            config['indices_file'] = indices_file
+            np.save(indices_file, self.indices)
+
+        with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.json"), 'w') as cfg:
+            json.dump(config, cfg)
+
+    @staticmethod
+    def load(root_dir: os.PathLike, file_name: str) -> 'Indices':
+        with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.json"), 'r') as cfg:
+            config = json.load(cfg)
+        if config['hardcoded']:
+            indices = np.load(config['indices_file'])
+            return Indices(indices=indices, repr=None)
+        else:
+            return Indices.from_seed(**config['repr'])
 
 class Pool:
-    def __init__(self, root_dir: os.PathLike, dataset_id: DatasetID, indices: npt.NDArray[np.int64]):
-        self.root_dir = root_dir
-        self.dataset_id = dataset_id
+    def __init__(self, indices: Indices, dataset: Dataset | None):
         self.indices = indices
-        self.__dataset = None
+        self.__dataset = dataset
         self.__pool = None
     
     @property
     def pool(self) -> datasets.Dataset:
         if self.__pool is None:
-            if self.__dataset is None:
-                dataset = Dataset(self.dataset_id, root_dir=self.root_dir)
-                self.__dataset = dataset.dataset['train']
-            self.__pool = self.__dataset.select(self.indices.tolist())
+            self.__pool = self.__dataset.dataset.select(self.indices.indices.tolist())
         return self.__pool
     
     @property
     def size(self) -> int:
         return len(self.indices)
     
+    def dump(self, root_dir: os.PathLike, file_name: str):
+        config = {
+            'indices_file': f"{file_name}_indices.json",
+            'pool_file': f"{file_name}_pool.dat",
+        }
+        with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_pool.json"), 'w') as cfg:
+            json.dump(config, cfg)
+        self.indices.dump(root_dir, file_name)
+        np.save(os.path.join(root_dir, DATA_DIR, f"{file_name}_pool.dat"), self.pool)
 
+    @staticmethod
+    def load(root_dir: os.PathLike, file_name: str, dataset: Dataset | None = None) -> 'Pool':
+        with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_pool.json"), 'r') as cfg:
+            config = json.load(cfg)
+        indices = Indices.load(root_dir, file_name)
+        pool_data = np.load(os.path.join(root_dir, DATA_DIR, config['pool_file']), allow_pickle=True).item()
+        pool = Pool(indices=indices, dataset=dataset)
+        pool.__pool = pool_data
+        return pool
 
 class Datasets:
     def __init__(self, *datasets: Dataset):
@@ -166,21 +227,20 @@ class DataDatabase:
         ...
     
     # def loadExperiment()
-        
-@dataclasses.dataclass
-class Experiment:
-    seed: int
-    dataset: Dataset
-    split: int 
-    cold_start_strategy: ColdStartStrategy
-    active_learning_strategy: ActiveLearningStrategy
-    macro_f1: float
-    accuracy: float
 
-    @staticmethod
-    def load_experiment(format: 'ExperimentFormat', experiment_config: 'ExperimentConfig') -> 'Experiment':
-        ...
 
-    @property
-    def budget(self) -> int:
-        return self.cold_start_strategy.budget + self.active_learning_strategy.budget
+
+def to_transformers_dataset(tokenizer: BertTokenizerFast, subset: datasets.Dataset, num_classes: int, max_length: int = 128) -> TransformersDataset:
+    texts = subset["text"]
+    labels = np.array(subset["label"], dtype=np.int64)
+    target_labels = np.arange(num_classes, dtype=np.int64)
+
+    ds = TransformersDataset.from_arrays(
+        texts,
+        labels,
+        tokenizer,
+        target_labels=target_labels,
+        max_length=max_length,
+    )
+    return ds
+
