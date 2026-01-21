@@ -11,18 +11,69 @@ import json
 
 DATA_DIR = 'data'
 
+class Indices:
+    def __init__(self, indices: npt.NDArray[np.int64], repr: dict[str, any] | None):
+        self.indices = indices
+        self.repr = repr
+
+    @property
+    def size(self) -> int:
+        return len(self.indices)
+    
+    @staticmethod
+    def from_seed(*, size: int, seed: int, dataset_size: int) -> 'Indices':
+        rng = np.random.default_rng(seed)
+        indices = np.arange(dataset_size)
+        rng.shuffle(indices)
+        return Indices(indices=indices[:size], repr={"seed": seed, "size": size, "dataset_size": dataset_size})
+
+    def dump(self, root_dir: os.PathLike, file_name: str):
+        config = {
+            'hardcoded': self.repr is None, 
+        }
+        if self.repr is not None:
+            config['repr'] = self.repr
+        else:
+            indices_file =  os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.dat") 
+            config['indices_file'] = indices_file
+            np.save(indices_file, self.indices)
+
+        with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.json"), 'w') as cfg:
+            json.dump(config, cfg)
+
+    @staticmethod
+    def load(root_dir: os.PathLike, file_name: str) -> 'Indices':
+        with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.json"), 'r') as cfg:
+            config = json.load(cfg)
+        if config['hardcoded']:
+            indices = np.load(config['indices_file'])
+            return Indices(indices=indices, repr=None)
+        else:
+            return Indices.from_seed(**config['repr'])
 @dataclasses.dataclass
 class DatasetID:
     path: str
     subset: str | None = None
+    base: 'DatasetID' | None = None
+    indices: Indices | None = None
 
     def __str__(self):
-        if self.subset is None:
-            return self.path
-        return f"{self.path.replace('/', '_')} {self.subset}"
+        if self.base is None:
+            if self.subset is None:
+                return self.path
+            return f"{self.path.replace('/', '_')} {self.subset}"
+        else:
+            return f"Pool[{str(self.base)}#{self.indices.repr}]"
     
     @staticmethod
     def from_str(id_str: str) -> 'DatasetID':
+        if id_str.startswith('Pool['):
+            inner = id_str[len('Pool['):-1]
+            base_str, indices_str = inner.split('#')
+            base = DatasetID.from_str(base_str)
+            indices_repr = json.loads(indices_str.replace("'", '"'))
+            indices = Indices.from_seed(**indices_repr)
+            return DatasetID(path='', subset=None, base=base, indices=indices)
         if not id_str.endswith('None'):
             parts = id_str.split(' ')
             path = parts[0].replace('_', '/')
@@ -83,17 +134,31 @@ class Dataset:
         self.__annotations = None
         self.root_dir = root_dir if root_dir is not None else os.getcwd()
 
+    def get_id(self) -> str:
+        return str(self.id)
+    
     def dump(self, root_dir: os.PathLike):
-        str_id = str(self.id)
+        str_id = self.get_id()
         dataset_file = os.path.join(root_dir, DATA_DIR, f"{str_id}.json")
         config = {
             'id': str_id,
             'annotations': {llm.to_str(): LLMLabels.id_to_file_name(str_id, llm) for llm in self.annotations.keys()} if self.__annotations is not None else {},
         }    
+
+        if self.id.base is not None and self.id.indices is not None:
+            config['base'] = str(self.id.base)
+            config['base_file'] = os.path.join(DATA_DIR, f"{str(self.id.base)}.json")
+            config['indices_file'] = os.path.join(DATA_DIR, f"{str_id}_indices.json")
+            Dataset(id=self.id.base, text_field=self.text_field, label_field=self.label_field, root_dir=self.root_dir).dump(root_dir)
+            self.id.indices.dump(root_dir, str_id)
+    
         with open(dataset_file, 'w') as df:
             json.dump(config, df)
         for _, labels in self.annotations.items():  
             labels.dump(root_dir, str_id)
+        
+    def get_filename(self) -> str:
+        return os.path.join(DATA_DIR, f"{self.get_id()}.json")
 
     @property
     def annotations(self) ->  dict[LLMType, LLMLabels]:
@@ -111,6 +176,10 @@ class Dataset:
     @property
     def dataset(self) -> datasets.Dataset:
         if self.__dataset is None:
+            if self.id.base is not None and self.id.indices is not None:
+                base_dataset = Dataset(self.id.base, self.text_field, self.label_field, self.root_dir)
+                self.__dataset = base_dataset.dataset.select(self.id.indices.indices.tolist())
+                return self.__dataset
             if self.id.subset is None:
                 self.__dataset = datasets.load_dataset(self.id.path, trust_remote_code=True)
             else:
@@ -139,46 +208,6 @@ class Dataset:
     def validation(self) -> datasets.Dataset:
         return self.dataset.get("validation", self.dataset["test"])
 
-class Indices:
-    def __init__(self, indices: npt.NDArray[np.int64], repr: dict[str, any] | None):
-        self.indices = indices
-        self.repr = repr
-
-    @property
-    def size(self) -> int:
-        return len(self.indices)
-    
-    @staticmethod
-    def from_seed(*, size: int, seed: int, dataset_size: int) -> 'Indices':
-        rng = np.random.default_rng(seed)
-        indices = np.arange(dataset_size)
-        rng.shuffle(indices)
-        return Indices(indices=indices[:size], repr={"seed": seed, "size": size, "dataset_size": dataset_size})
-
-    def dump(self, root_dir: os.PathLike, file_name: str):
-        config = {
-            'hardcoded': self.repr is None, 
-        }
-        if self.repr is not None:
-            config['repr'] = self.repr
-        else:
-            indices_file =  os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.dat") 
-            config['indices_file'] = indices_file
-            np.save(indices_file, self.indices)
-
-        with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.json"), 'w') as cfg:
-            json.dump(config, cfg)
-
-    @staticmethod
-    def load(root_dir: os.PathLike, file_name: str) -> 'Indices':
-        with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_indices.json"), 'r') as cfg:
-            config = json.load(cfg)
-        if config['hardcoded']:
-            indices = np.load(config['indices_file'])
-            return Indices(indices=indices, repr=None)
-        else:
-            return Indices.from_seed(**config['repr'])
-
 class Pool:
     def __init__(self, indices: Indices, dataset: Dataset | None):
         self.indices = indices
@@ -186,33 +215,62 @@ class Pool:
         self.__pool = None
     
     @property
-    def pool(self) -> datasets.Dataset:
+    def pool(self) -> Dataset:
         if self.__pool is None:
-            self.__pool = self.__dataset.dataset.select(self.indices.indices.tolist())
+            self.__pool = Dataset(
+                id=DatasetID(
+                    path='',
+                    subset=None,
+                    base=self.__dataset.id,
+                    indices=self.indices,
+                ),
+                text_field=self.__dataset.text_field,
+                label_field=self.__dataset.label_field,
+                root_dir=self.__dataset.root_dir,
+            )            
         return self.__pool
     
     @property
     def size(self) -> int:
         return len(self.indices)
     
+    def __str__(self):
+        return self.indices.repr
+
     def dump(self, root_dir: os.PathLike, file_name: str):
         config = {
             'indices_file': f"{file_name}_indices.json",
-            'pool_file': f"{file_name}_pool.dat",
+            'pool_files': {key: f"{file_name}_pool_{key}.dat" for key in self.pool.dataset},
+            'dataset_id': str(self.__dataset.get_id()) if self.__dataset is not None else None,
         }
         with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_pool.json"), 'w') as cfg:
             json.dump(config, cfg)
         self.indices.dump(root_dir, file_name)
-        np.save(os.path.join(root_dir, DATA_DIR, f"{file_name}_pool.dat"), self.pool)
+        for key, file in config['pool_files'].items():
+            np.save(os.path.join(root_dir, DATA_DIR, file), self.pool.dataset[key])
 
     @staticmethod
     def load(root_dir: os.PathLike, file_name: str, dataset: Dataset | None = None) -> 'Pool':
         with open(os.path.join(root_dir, DATA_DIR, f"{file_name}_pool.json"), 'r') as cfg:
             config = json.load(cfg)
         indices = Indices.load(root_dir, file_name)
-        pool_data = np.load(os.path.join(root_dir, DATA_DIR, config['pool_file']), allow_pickle=True).item()
+        pool_data = datasets.DatasetDict()
+        for key, file in config['pool_files'].items():
+            data_array = np.load(os.path.join(root_dir, DATA_DIR, file))
+            pool_data[key] = datasets.Dataset.from_dict({key: data_array})
         pool = Pool(indices=indices, dataset=dataset)
-        pool.__pool = pool_data
+        pool.__pool = Dataset(
+            id=DatasetID(
+                path='',
+                subset=None,
+                base=dataset.id if dataset is not None else DatasetID.from_str(config['dataset_id']),
+                indices=indices,
+            ),
+            text_field=dataset.text_field if dataset is not None else 'text',
+            label_field=dataset.label_field if dataset is not None else 'label',
+            root_dir=root_dir,
+        )
+        pool.__pool.__dataset = pool_data
         return pool
 
 class Datasets:
@@ -227,8 +285,6 @@ class DataDatabase:
         ...
     
     # def loadExperiment()
-
-
 
 def to_transformers_dataset(tokenizer: BertTokenizerFast, subset: datasets.Dataset, num_classes: int, max_length: int = 128) -> TransformersDataset:
     texts = subset["text"]
