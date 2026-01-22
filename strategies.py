@@ -28,7 +28,7 @@ def evaluate_on_test(active_learner: PoolBasedActiveLearner, test_dataset: Trans
     macro_f1 = f1_score(y_true, y_pred, average="macro")
     return acc, macro_f1
 
-class QueryStrategyType(ABC):
+class QueryStrategyType(ABC, Stringifiable):
     @abstractmethod
     def get_parameters(self) -> dict[str, any]:
         pass
@@ -43,6 +43,14 @@ class QueryStrategyType(ABC):
 
     @abstractmethod
     def run_loop(self, pool: database.DatasetView, active_learner: PoolBasedActiveLearner, indices_labeled: npt.NDArray[np.int64], test_dataset: TransformersDataset, n_iterations: int, batch_size: int) -> tuple[float, float, datetime.timedelta, npt.NDArray[np.int64]]:
+        pass
+    
+    def __str__(self) -> str:
+        return self.query_strategy_name()
+
+    @abstractmethod
+    @staticmethod
+    def from_str(s: str) -> 'QueryStrategyType':
         pass
 
 class SimpleQueryStrategyType(enum.Enum, Stringifiable):
@@ -119,6 +127,10 @@ class QueryStrategySimple(QueryStrategyType):
         acc, macro_f1 = evaluate_on_test(active_learner, test_dataset)
         duration = datetime.timedelta(seconds=end - start)
         return acc, macro_f1, duration, indices_labeled
+    
+    @staticmethod
+    def from_str(s: str) -> 'QueryStrategySimple':
+        return QueryStrategySimple(SimpleQueryStrategyType.from_str(s))
 
 class MockQueryStrategyType(QueryStrategyType):
     def get_parameters(self) -> dict[str, any]:
@@ -136,6 +148,13 @@ class MockQueryStrategyType(QueryStrategyType):
         acc, macro_f1 = evaluate_on_test(active_learner, test_dataset)
         duration = datetime.timedelta(seconds=end - start)
         return acc, macro_f1, duration, indices_labeled
+    
+    @staticmethod
+    def from_str(s: str) -> 'MockQueryStrategyType':
+        if s != "mock":
+            raise ValueError("Invalid string for MockQueryStrategyType")
+        return MockQueryStrategyType()
+    
     
 @dataclasses.dataclass
 class ColdStartStrategy(Stringifiable):
@@ -174,6 +193,16 @@ class ColdStartStrategy(Stringifiable):
             query_strategy=query_strategy,
             batch_size=budget
         )
+    
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ColdStartStrategy):
+            return False
+        return (self.query_strategy.query_strategy_name() == other.query_strategy.query_strategy_name() and
+                self.batch_size == other.batch_size and self.budget == other.budget
+                )
+    
+    def __hash__(self):
+        return hash((self.query_strategy.query_strategy_name(), self.batch_size, self.budget))
 
 class ActiveLearningStrategy(Stringifiable):
     def __init__(
@@ -217,6 +246,7 @@ class ActiveLearningStrategy(Stringifiable):
             return self.batch_size
         else:
             return self.budget - self.batch_size * (self.n_iterations - 1)
+        
 
 class ComposeStrategyWrapper(QueryStrategy):
     def __init__(self, al_strategy: ActiveLearningStrategy, cs_strategy: ColdStartStrategy):

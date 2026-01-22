@@ -1,4 +1,5 @@
 from utils import Stringifiable, Dumpable, JSONifiable
+import strategies
 
 from transformers.models.bert.tokenization_bert_fast import BertTokenizerFast
 from small_text.integrations.transformers.datasets import TransformersDataset
@@ -74,7 +75,8 @@ class Indices(Dumpable):
             print("Warning: cannot dump Indices on exit")
         else:
             self.dump(self.__root_dir, self.__filename)
-@dataclasses.dataclass
+
+@dataclasses.dataclass(frozen=True, eq=True)
 class DatasetID(Stringifiable):
     path: str
     subset: str | None = None
@@ -93,6 +95,7 @@ class DatasetID(Stringifiable):
             return DatasetID(path=path, subset=subset)
         else:
             return DatasetID(path=id_str, subset=None)
+        
     
 class LLMType(enum.Enum, Stringifiable):
     GIGACHAT = enum.auto()
@@ -428,11 +431,55 @@ class Datasets:
     def __init__(self, *datasets: Dataset):
         self.datasets = datasets
         
-class DataDatabase:
-    def __init__(self):
-        self.datasets: Datasets 
-        self.experiments: 'Experiments'
-
-        ...
+class DataDatabase(Dumpable):
+    EXPERIMENTS_FILE = "experiments.json"
+    DATASETS_FILE = "datasets.json"
+    BACKUPS_COUNT = 5
     
-    # def loadExperiment()
+    def __init__(self, root_dir: os.PathLike):
+        self.root_dir = root_dir
+        self.datasets: Datasets = DataDatabase.load_datasets(root_dir)
+        self.experiments: strategies.Experiments = DataDatabase.load_experiments(root_dir)
+
+    def load_experiments(root_dir: os.PathLike) -> strategies.Experiments:
+        # TODO: think about it 
+        ...
+
+    @staticmethod
+    def get_config_filename() -> str:
+        return "DONT_EVER_TOUCH_THIS_FILE_database8=D.json"
+    
+    def get_config(self) -> dict:
+        old_config = {}
+        if os.path.exists(os.path.join(self.root_dir, DATA_DIR, self.get_config_filename())):
+            with open(os.path.join(self.root_dir, DATA_DIR, self.get_config_filename()), 'r') as dbf:
+                old_config = json.load(dbf)
+        last_backup_id = old_config.get('backup_id', 1)
+        return {
+            'datasets_file': os.path.join(DATA_DIR, self.DATASETS_FILE),
+            'experiments_file': os.path.join(DATA_DIR, self.EXPERIMENTS_FILE),
+            'backup_id': last_backup_id + 1,
+            'backup_file': f"{self.get_config_filename()[:-5]}_{last_backup_id}.json",
+        }
+    
+    def dump(self, root_dir: os.PathLike, filename: str | None = None):
+        config = self.get_config()
+        if os.path.exists(os.path.join(self.root_dir, DATA_DIR, self.get_config_filename())):
+            os.rename(
+                os.path.join(self.root_dir, DATA_DIR, self.get_config_filename()),
+                os.path.join(self.root_dir, DATA_DIR, config['backup_file'])
+            )
+        if os.path.exists(os.path.join(self.root_dir, DATA_DIR, f"{self.get_config_filename()[:-5]}_{(config['backup_id'] - self.BACKUPS_COUNT)}.json")):
+            os.remove(os.path.join(self.root_dir, DATA_DIR, f"{self.get_config_filename()[:-5]}_{(config['backup_id'] - self.BACKUPS_COUNT)}.json"))
+        
+        with open(os.path.join(
+                root_dir, 
+                DATA_DIR, 
+                filename if filename is not None else self.get_config_filename()
+                ), 'w') as dbf:
+            json.dump(config, dbf)
+        ... # TODO incremental dump of datasets and experiments
+
+    @staticmethod
+    def load(root_dir: os.PathLike, filename: str) -> 'DataDatabase':
+        raise RuntimeError("Use DataDatabase(root_dir) instead of load")

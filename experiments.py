@@ -11,6 +11,8 @@ import torch
 import dataclasses
 import os
 import json
+import itertools
+import functools
 
 @dataclasses.dataclass
 class ExperimentHistory(JSONifiable):
@@ -265,3 +267,176 @@ class Experiment(Dumpable):
             duration_cs=duration_cs,
             duration_total=duration_cs + duration_al,
         ) 
+
+class Experiments(JSONifiable):
+    @dataclasses.dataclass(frozen=True, eq=True)
+    class ExperimentKey(JSONifiable):
+        dataset_id: database.DatasetID 
+        pool_size: int 
+        seed: int 
+        split: int 
+        budget: int 
+        cs_strategy: strategies.ColdStartStrategy
+        al_strategy: strategies.QueryStrategyType
+
+        @staticmethod
+        def from_experiment(experiment: Experiment) -> 'Experiments.ExperimentKey':
+            return Experiments.ExperimentKey(
+                dataset_id=experiment.dataset.get_id(),
+                pool_size=experiment.pool.size,
+                seed=experiment.pool.indices.repr['seed'] if experiment.pool.indices.repr is not None else -1,
+                split=experiment.split,
+                budget=experiment.budget,
+                cs_strategy=experiment.cold_start_strategy,
+                al_strategy=experiment.active_learning_strategy.query_strategy,
+            )
+
+        @staticmethod
+        def empty() -> 'Experiments.ExperimentKey':
+            return Experiments.ExperimentKey(None, None, None, None, None, None, None)
+        
+        def equivalent(self, other: 'Experiments.ExperimentKey') -> bool:
+            return (
+                (self.dataset_id is None or other.dataset_id is None or self.dataset_id == other.dataset_id) and
+                (self.pool_size is None or other.pool_size is None or self.pool_size == other.pool_size) and
+                (self.seed is None or other.seed is None or self.seed == other.seed) and
+                (self.split is None or other.split is None or self.split == other.split) and
+                (self.budget is None or other.budget is None or self.budget == other.budget) and
+                (self.cs_strategy is None or other.cs_strategy is None or self.cs_strategy == other.cs_strategy) and
+                (self.al_strategy is None or other.al_strategy is None or self.al_strategy == other.al_strategy)
+            )
+        
+        def to_json(self) -> dict:
+            return {
+                'dataset_id': str(self.dataset_id),
+                'pool_size': self.pool_size,
+                'seed': self.seed,
+                'split': self.split,
+                'budget': self.budget,
+                'cs_strategy': str(self.cs_strategy),
+                'al_strategy': str(self.al_strategy),
+            }
+        
+        @staticmethod
+        def from_json(data: dict) -> 'Experiments.ExperimentKey':
+            return Experiments.ExperimentKey(
+                dataset_id=database.DatasetID.from_str(data['dataset_id']),
+                pool_size=data['pool_size'],
+                seed=data['seed'],
+                split=data['split'],
+                budget=data['budget'],
+                cs_strategy=strategies.ColdStartStrategy.from_str(data['cs_strategy']),
+                al_strategy=strategies.QueryStrategyType.from_str(data['al_strategy']), # TODO: implrment generic subclass instantion
+            )
+
+    @dataclasses.dataclass(eq=True)
+    class ExperimentInfo(JSONifiable):
+        force: bool | None = None
+
+        def to_json(self) -> dict:
+            return  dataclasses.asdict(self)
+        
+        @staticmethod
+        def from_json(data: dict) -> 'Experiments.ExperimentInfo':
+            return Experiments.ExperimentInfo(**data)
+
+    def __init__(self, *experiments: Experiment):
+        self.experiments = experiments
+        self.__experiments_map = {
+            Experiments.ExperimentKey.from_experiment(exp): (exp, i, Experiments.ExperimentInfo()) 
+            for i, exp in enumerate(experiments)
+        }
+
+    def __iter__(self):
+        return iter(self.experiments)
+    
+    def __len__(self):
+        return len(self.experiments)
+    
+    def merge(self, other: 'Experiments') -> 'Experiments':
+        self.__experiments_map.update(other.__experiments_map)
+        self.experiments = [exp for exp, _, _ in sorted(self.__experiments_map.values(), key=lambda x: x[1])]
+        return self
+    
+    @staticmethod
+    def from_experiments(*experiments: 'Experiments') -> 'Experiments':
+        return functools.reduce(lambda acc, exp: acc.merge(exp), experiments, Experiments())
+    
+    @staticmethod
+    def from_product(
+            datasets: list[database.Dataset],
+            seeds: list[int], 
+            pool_size: int,
+            cold_start_strategies: list[strategies.QueryStrategyType], 
+            active_learning_strategies: list[strategies.QueryStrategyType], 
+            bugdets: list[int],
+            splits: list[int],
+            al_batch_size: int,
+            root_dir: os.PathLike | None = None
+        ) -> 'Experiments':
+        return Experiments(*(
+            Experiment(
+                dataset=dataset,
+                pool=database.Pool(
+                    database.Indices.from_seed(size=pool_size, seed=seed, dataset_size=len(dataset.dataset.train)),
+                    dataset
+                ),
+                cold_start_strategy=strategies.ColdStartStrategy(cs_strategy_type, batch_size=split),
+                active_learning_strategy=strategies.ActiveLearningStrategy(al_strategy_type, al_batch_size, budget - split),
+                root_dir=root_dir if root_dir is not None else os.getcwd(),
+            ) for dataset, seed, cs_strategy_type, al_strategy_type, budget, split in itertools.product(
+                datasets, seeds, cold_start_strategies, active_learning_strategies, bugdets, splits,
+            )
+        ))
+    
+    def run_all(self, tokenizer: BertTokenizerFast, fine_tuning_model: str, *, default_force: bool = False): 
+        for experiment in self.experiments:
+            experiment_info = self.__experiments_map[Experiments.ExperimentKey.from_experiment(experiment)][2]
+            force = default_force if experiment_info.force is None else experiment_info.force
+            with experiment:
+                experiment.run(tokenizer, fine_tuning_model, force=force)
+
+    def __get_item__(self, key: 'Experiments.ExperimentKey') -> tuple[Experiment, int, 'Experiments.ExperimentInfo']:
+        matching = {e for e in self.__experiments_map.keys() if e.equivalent(key)}
+        if len(matching) != 1:
+            raise KeyError(f"Key {key} is ambiguous, matches {len(matching)} experiments")
+        return self.__experiments_map[matching.pop()]
+    
+    def matching(self, key: 'Experiments.ExperimentKey') -> set[tuple[Experiment, int, 'Experiments.ExperimentInfo']]:
+        return {self.__experiments_map[e] for e in self.__experiments_map.keys() if e.equivalent(key)}
+    
+    def get_config(self, external_id: None = None) -> dict:
+        return {
+            'experiments': { 
+                i : { 
+                    'experiment': os.path.join(database.DATA_DIR, experiment.get_config()),
+                    'info': info.to_json(),
+                    'key': key.to_json(),
+                } 
+                for key, (experiment, i, info) in self.__experiments_map.items()
+            },
+        }
+    
+
+    def to_json(self) -> dict:
+        return {
+            'experiments': { 
+                i : { 
+                    'experiment': os.path.join(database.DATA_DIR, experiment.get_config()),
+                    'info': info.to_json(),
+                    'key': key.to_json(),
+                } 
+                for key, (experiment, i, info) in self.__experiments_map.items()
+            },
+            'root_dir': self.experiments[0].root_dir
+        }
+    
+    def from_json(data: dict) -> 'Experiments':
+        root_dir = data['root_dir']
+        return Experiments(*(
+            Experiment.load(
+                root_dir,
+                exp_data['experiment']
+            ) 
+            for _, exp_data in sorted(data['experiments'].items(), key=lambda x: int(x[0]))
+        ))
