@@ -1,3 +1,6 @@
+from utils import Stringifiable
+import database
+
 import small_text
 from small_text.query_strategies import QueryStrategy
 from small_text.integrations.pytorch.query_strategies import BADGE
@@ -8,6 +11,7 @@ from small_text import PoolBasedActiveLearner
 from small_text.integrations.transformers.datasets import TransformersDataset
 from sklearn.metrics import accuracy_score, f1_score
 import numpy as np
+import numpy.typing as npt
 
 import enum
 import datasets
@@ -16,13 +20,14 @@ import datetime
 from abc import ABC, abstractmethod
 import time
 
-def evaluate_on_test(self, active_learner: PoolBasedActiveLearner, test_dataset: TransformersDataset) -> tuple[float, float]:
-        y_pred = active_learner.classifier.predict(test_dataset)
-        y_true = test_dataset.y
+def evaluate_on_test(active_learner: PoolBasedActiveLearner, test_dataset: TransformersDataset) -> tuple[float, float]:
+    y_pred = active_learner.classifier.predict(test_dataset)
+    y_true = test_dataset.y
 
-        acc = accuracy_score(y_true, y_pred)
-        macro_f1 = f1_score(y_true, y_pred, average="macro")
-        return acc, macro_f1
+    acc = accuracy_score(y_true, y_pred)
+    macro_f1 = f1_score(y_true, y_pred, average="macro")
+    return acc, macro_f1
+
 class QueryStrategyType(ABC):
     @abstractmethod
     def get_parameters(self) -> dict[str, any]:
@@ -37,11 +42,10 @@ class QueryStrategyType(ABC):
         pass
 
     @abstractmethod
-    def run_loop(self, pool: TransformersDataset, active_learner: PoolBasedActiveLearner, indices_labeled: list[int], test_dataset: TransformersDataset, n_iterations: int, batch_size: int) -> tuple[float, float, datetime.timedelta, list[int]]:
+    def run_loop(self, pool: database.DatasetView, active_learner: PoolBasedActiveLearner, indices_labeled: npt.NDArray[np.int64], test_dataset: TransformersDataset, n_iterations: int, batch_size: int) -> tuple[float, float, datetime.timedelta, npt.NDArray[np.int64]]:
         pass
 
-
-class SimpleQueryStrategyType(enum.Enum):
+class SimpleQueryStrategyType(enum.Enum, Stringifiable):
     RANDOM = enum.auto()
     LEAST_CONFIDENCE = enum.auto()
     BALD = enum.auto()
@@ -62,7 +66,7 @@ class SimpleQueryStrategyType(enum.Enum):
     }
     REVERSE_QUERY_STRATEGY_CLASS_MAPPINGS = {v: k for k, v in QUERY_STRATEGY_CLASS_MAPPINGS.items()}
 
-    def to_str(self) -> str:
+    def __str__(self) -> str:
         return self.STR_MAPPINGS[self]
     
     @classmethod
@@ -102,11 +106,11 @@ class QueryStrategySimple(QueryStrategyType):
     def query_strategy_class(self, num_classes: int) -> QueryStrategy:
         return self.__strategy.to_query_strategy(num_classes=num_classes)
     
-    def run_loop(self, pool: TransformersDataset, active_learner: PoolBasedActiveLearner, indices_labeled: list[int], test_dataset: TransformersDataset, n_iterations: int, batch_size: int) -> tuple[float, float, datetime.timedelta, list[int]]:
+    def run_loop(self, pool: database.DatasetView, active_learner: PoolBasedActiveLearner, indices_labeled: npt.NDArray[np.int64], test_dataset: TransformersDataset, n_iterations: int, batch_size: int) -> tuple[float, float, datetime.timedelta, npt.NDArray[np.int64]]:
         start = time.perf_counter()
         for _ in range(n_iterations):
             queried_indices = active_learner.query(num_samples=batch_size)
-            y_queried = pool.y[queried_indices] # TODO: implement querying logic from different oracles
+            y_queried = pool.train.y[queried_indices] # TODO: implement querying logic from different oracles
             active_learner.update(y_queried)
             indices_labeled = np.concatenate([indices_labeled, queried_indices])
 
@@ -126,7 +130,7 @@ class MockQueryStrategyType(QueryStrategyType):
     def query_strategy_class(self) -> QueryStrategy:
         raise NotImplementedError("MockQueryStrategyType does not implement query_strategy_class")
     
-    def run_loop(self, pool: TransformersDataset, active_learner: PoolBasedActiveLearner, indices_labeled: list[int], test_dataset: TransformersDataset, n_iterations: int, batch_size: int) -> tuple[float, float, datetime.timedelta, list[int]]:
+    def run_loop(self, pool: database.DatasetView, active_learner: PoolBasedActiveLearner, indices_labeled: npt.NDArray[np.int64], test_dataset: TransformersDataset, n_iterations: int, batch_size: int) -> tuple[float, float, datetime.timedelta, npt.NDArray[np.int64]]:
         start = time.perf_counter()
         end = time.perf_counter()
         acc, macro_f1 = evaluate_on_test(active_learner, test_dataset)
@@ -134,7 +138,7 @@ class MockQueryStrategyType(QueryStrategyType):
         return acc, macro_f1, duration, indices_labeled
     
 @dataclasses.dataclass
-class ColdStartStrategy:
+class ColdStartStrategy(Stringifiable):
     query_strategy: QueryStrategyType
     batch_size: int # Размер выборки для обучения на одной итерации
     
@@ -146,7 +150,7 @@ class ColdStartStrategy:
     def n_iterations(self) -> int:
         return 1
     
-    def __str__(self):
+    def __str__(self) -> str:
         return f"{self.query_strategy.query_strategy_name()}_{self.budget}_{self.batch_size}"
     
     @staticmethod
@@ -171,23 +175,23 @@ class ColdStartStrategy:
             batch_size=budget
         )
 
-class ActiveLearningStrategy:
+class ActiveLearningStrategy(Stringifiable):
     def __init__(
         self,
         query_strategy: QueryStrategyType,
-        step_size: int, # Размер выборки для обучения на одной итерации
+        batch_size: int, # Размер выборки для обучения на одной итерации
         budget: int, # Общий бюджет на активное обучение
     ):
         self.query_strategy = query_strategy
-        self.step_size = step_size
+        self.batch_size = batch_size
         self.budget = budget
 
     @property
     def n_iterations(self) -> int:
-        return self.budget // self.step_size + (1 if self.budget % self.step_size > 0 else 0)
+        return self.budget // self.batch_size + (1 if self.budget % self.batch_size > 0 else 0)
 
-    def __str__(self):
-        return f"{self.query_strategy.query_strategy_name()}_{self.budget}_{self.n_iterations}_{self.step_size}"
+    def __str__(self) -> str:
+        return f"{self.query_strategy.query_strategy_name()}_{self.budget}_{self.n_iterations}_{self.batch_size}"
 
     @staticmethod
     def from_str(strategy_str: str) -> 'ActiveLearningStrategy':
@@ -202,7 +206,7 @@ class ActiveLearningStrategy:
             raise ValueError("Inconsistent budget, step_size and n_iterations")
         return ActiveLearningStrategy(
             query_strategy=QueryStrategySimple(query_strategy),
-            step_size=step_size,
+            batch_size=step_size,
             budget=budget
         )
     
@@ -210,9 +214,9 @@ class ActiveLearningStrategy:
         if iteration < 0 or iteration >= self.n_iterations:
             raise ValueError("Invalid iteration number")
         if iteration < self.n_iterations - 1:
-            return self.step_size
+            return self.batch_size
         else:
-            return self.budget - self.step_size * (self.n_iterations - 1)
+            return self.budget - self.batch_size * (self.n_iterations - 1)
 
 class ComposeStrategyWrapper(QueryStrategy):
     def __init__(self, al_strategy: ActiveLearningStrategy, cs_strategy: ColdStartStrategy):
