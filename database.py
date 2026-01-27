@@ -1,5 +1,5 @@
 from utils import Stringifiable, Dumpable, JSONifiable
-import strategies
+import experiments
 
 from transformers.models.bert.tokenization_bert_fast import BertTokenizerFast
 from small_text.integrations.transformers.datasets import TransformersDataset
@@ -11,6 +11,9 @@ import dataclasses
 import enum
 import os
 import json
+import uuid
+import contextlib
+from typing import Iterable
 
 DATA_DIR = 'data'
 
@@ -148,6 +151,11 @@ class LLMLabels(Dumpable):
             config = json.load(cfg)
         return LLMLabels(llm=LLMType.from_str(config['llm']), labels=np.load(os.path.join(root_dir, config['labels'])) )
     
+    def __eq__(self, value):
+        if not isinstance(value, LLMLabels):
+            return False
+        return self.llm == value.llm and np.array_equal(self.labels, value.labels)
+    
     def __call__(self, root_dir: os.PathLike, filename: str) -> 'LLMLabels':
         self.__filename = filename
         self.__root_dir = root_dir
@@ -234,7 +242,7 @@ class Dataset(Dumpable, JSONifiable):
 
     @staticmethod
     def load(root_dir: os.PathLike, filename: str) -> 'Dataset':
-        with open(os.path.join(root_dir, DATA_DIR, filename), 'r') as df:
+        with open(os.path.join(root_dir, filename), 'r') as df:
             config = json.load(df)
         dataset = Dataset(
             id=DatasetID.from_str(config['id']),
@@ -426,25 +434,108 @@ class DatasetView:
             max_length=max_length,
         )
 
+class  Datasets(JSONifiable):
+    def __init__(self, *datasets: Dataset, config_names: dict[DatasetID, str] | None = None):
+        self.datasets = {dataset.id: (dataset, dataset.get_config_filename()) for dataset in datasets}
+        for dataset_id, config_name in (config_names or {}).items():
+            if dataset_id not in self.datasets:
+                raise ValueError("Config name provided for unknown dataset ID")
+            self.datasets[dataset_id] = (self.datasets[dataset_id][0], config_name)
 
-class Datasets:
-    def __init__(self, *datasets: Dataset):
-        self.datasets = datasets
+    def __contains__(self, key: Dataset | DatasetID) -> bool:
+        if isinstance(key, Dataset):
+            key = key.id
+        return key in self.datasets
         
+    def to_json(self) -> dict:
+        return {
+            'datasets': {key: os.path.join(DATA_DIR, config_name) for key, (_, config_name) in self.datasets.items()}, 
+        }
+    
+    @staticmethod
+    def from_json(data: dict, root_dir: os.PathLike| None = None) -> 'Datasets': # TODO implement remote
+        if root_dir is None:
+            raise ValueError("root_dir must be provided to load Datasets from json")
+        return Datasets(*[
+            Dataset.load(root_dir, filename) 
+            for filename in data['datasets'].values()
+        ])
+
+    def add(self, dataset: Dataset) -> None:
+        if dataset.id not in self.datasets:
+            self.datasets[dataset.id] = dataset 
+            return
+        raise ValueError("Dataset with the same ID already exists in the collection")
+    
+    def __get_item__(self, key: DatasetID) -> Dataset:
+        if key in self.datasets:
+            return self.datasets[key]
+        raise KeyError("Dataset not found in the collection")
+    
+    def __iter__(self) -> Iterable[Dataset]:
+        return iter(self.datasets.values())
+    
 class DataDatabase(Dumpable):
     EXPERIMENTS_FILE = "experiments.json"
     DATASETS_FILE = "datasets.json"
     BACKUPS_COUNT = 5
     
-    def __init__(self, root_dir: os.PathLike):
+    def __init__(self, root_dir: os.PathLike, local: bool = True): # TODO  implement remote
         self.root_dir = root_dir
-        self.datasets: Datasets = DataDatabase.load_datasets(root_dir)
-        self.experiments: strategies.Experiments = DataDatabase.load_experiments(root_dir)
+        self.datasets: Datasets = DataDatabase.__load_datasets(root_dir)
+        self.experiments: experiments.Experiments = DataDatabase.__load_experiments(root_dir)
+        self.local = local
+        self.__enter = False
 
-    def load_experiments(root_dir: os.PathLike) -> strategies.Experiments:
-        # TODO: think about it 
-        ...
+    def __load_experiments(self, root_dir: os.PathLike) -> experiments.Experiments:
+        if self.local:
+            if os.path.exists(os.path.join(root_dir, DATA_DIR, self.EXPERIMENTS_FILE)):
+                with open(os.path.join(root_dir, DATA_DIR, self.EXPERIMENTS_FILE), 'r') as ef:
+                    experiments_json = json.load(ef)
+                return experiments.Experiments.from_json(experiments_json)
+            return experiments.Experiments()
+        assert False, "Remote databases are not implemented yet" # TODO remote dbs
 
+    def __load_datasets(self, root_dir: os.PathLike) -> Datasets:
+        if self.local:
+            if os.path.exists(os.path.join(root_dir, DATA_DIR, self.DATASETS_FILE)):
+                with open(os.path.join(root_dir, DATA_DIR, self.DATASETS_FILE), 'r') as df:
+                    datasets_json = json.load(df)
+                return Datasets.from_json(datasets_json, root_dir)
+            return Datasets()
+        assert False, "Remote databases are not implemented yet" # TODO remote dbs
+
+    def register(self, experiment: experiments.Experiment) -> None: # TODO implement remote
+        if experiment not in self.experiments:
+            self.experiments.add(experiment) 
+    
+    def load(self, obj: experiments.Experiment): # TODO implement remote
+        if isinstance(obj, experiments.Experiment):
+            if obj in self:
+                key = experiments.Experiments.ExperimentKey.from_experiment(obj)
+                return self.experiments[key][0]
+            raise KeyError("Experiment not found in the database") 
+            
+    def __contains__(self, experiment: experiments.Experiment | DatasetID) -> bool:
+        if isinstance(experiment, experiments.Experiment):
+            return experiment in self.experiments
+        elif isinstance(experiment, DatasetID):
+            return experiment in self.datasets
+        
+    def get(self, obj: DatasetID):
+        if isinstance(obj, DatasetID):
+            if obj in self.datasets:
+                return self.datasets.datasets[obj]
+            dataset = Dataset(
+                id=obj,
+                text_field="text",
+                label_field="label",
+            )
+            self.datasets.add(dataset)
+            if self.__enter:
+                self.__exit_stack.enter_context(dataset(self.root_dir))
+            return dataset
+        
     @staticmethod
     def get_config_filename() -> str:
         return "DONT_EVER_TOUCH_THIS_FILE_database8=D.json"
@@ -462,6 +553,27 @@ class DataDatabase(Dumpable):
             'backup_file': f"{self.get_config_filename()[:-5]}_{last_backup_id}.json",
         }
     
+    @staticmethod
+    def __is_experiments_subset(cfg1: dict, cfg2: dict) -> bool:
+        return cfg1['root_dir'] == cfg2['root_dir'] and set(cfg1['experiments']).issubset(set(cfg2['experiments']))
+
+    @staticmethod
+    def __is_datasets_subset(cfg1: dict, cfg2: dict, root_dir: os.PathLike, datasets: Datasets) -> bool:
+        if not set(cfg1['datasets']).issubset(set(cfg2['datasets'])):
+            return False
+        for key in cfg1['datasets']:
+            ds1 = Dataset.load(root_dir, cfg1['datasets'][key])
+            ds2 = datasets[DatasetID.from_str(key)]
+            annot1 = ds1.annotations
+            annot2 = ds2.annotations
+            if set(annot1) != set(annot2):
+                return False
+            
+            if not all(annot1[llm] == annot2[llm] for llm in annot1):
+                return False
+        return True
+            
+
     def dump(self, root_dir: os.PathLike, filename: str | None = None):
         config = self.get_config()
         if os.path.exists(os.path.join(self.root_dir, DATA_DIR, self.get_config_filename())):
@@ -478,8 +590,90 @@ class DataDatabase(Dumpable):
                 filename if filename is not None else self.get_config_filename()
                 ), 'w') as dbf:
             json.dump(config, dbf)
-        ... # TODO incremental dump of datasets and experiments
 
+        with open(os.path.join(root_dir, DATA_DIR, self.EXPERIMENTS_FILE), 'r') as ef:
+            old_experiments = json.load(ef)
+        
+        experiments = self.experiments.to_json()
+        if not DataDatabase.__is_experiments_subset(old_experiments, experiments):
+            new_filename = f"{self.get_config_filename()[:-5]}_{uuid.uuid4()}.json"
+            print(f'WARNING: Some experiments are missing, saved previous file in {new_filename}')
+            os.rename(
+                os.path.join(self.root_dir, DATA_DIR, self.EXPERIMENTS_FILE),
+                os.path.join(self.root_dir, DATA_DIR, new_filename)
+            )
+
+        with open(os.path.join(root_dir, DATA_DIR, self.EXPERIMENTS_FILE), 'w') as ef:
+            json.dump(self.experiments.to_json(), ef)
+         #TODO implement proper incremental experiment dumping
+        # if not self.__enter:
+        #     for experiment in self.experiments:
+        #         experiment.dump(root_dir)
+
+        with open(os.path.join(root_dir, DATA_DIR, self.DATASETS_FILE), 'r') as df:
+            old_datasets = json.load(df)
+        
+        datasets_config = old_datasets
+
+        if not DataDatabase.__is_datasets_subset(old_datasets, self.datasets.to_json(), root_dir, self.datasets):
+            salt = f'{uuid.uuid4()}'
+            new_filename = f"{self.get_config_filename()[:-5]}_{salt}.json"
+            print(f'WARNING: Some datasets are missing or have different annotations, saved previous file in {new_filename}')
+            os.rename(
+                os.path.join(self.root_dir, DATA_DIR, self.DATASETS_FILE),
+                os.path.join(self.root_dir, DATA_DIR, new_filename)
+            )
+            for dataset_id in old_datasets['datasets']:
+                renamed = False
+                ds1 = Dataset.load(root_dir, old_datasets['datasets'][dataset_id])
+                ds2 = self.datasets[DatasetID.from_str(dataset_id)]
+                annot1 = ds1.annotations
+                annot2 = ds2.annotations
+                cfg1 = ds1.get_config()                
+                for llm in annot1:
+                    if not (annot1[llm] == annot2[llm]):
+                        print(f'WARNING: Annotations for dataset {dataset_id} and LLM {llm} differ between old and new database')
+                        filename = cfg1['annotations'][str(llm)]
+                        new_annotations_filename = f"{filename[:-5]}_{salt}.json"
+                        os.rename(
+                            os.path.join(self.root_dir, DATA_DIR, filename),
+                            os.path.join(self.root_dir, DATA_DIR, new_annotations_filename)
+                        )
+                        if not renamed:
+                            new_dataset_filename = f"{old_datasets['datasets'][dataset_id][:-5]}_{salt}.json"
+                            os.rename(
+                                os.path.join(self.root_dir, DATA_DIR, old_datasets['datasets'][dataset_id]),
+                                os.path.join(self.root_dir, DATA_DIR, new_dataset_filename)
+                            )
+                            renamed = True
+                        cfg1['annotations'][str(llm)] = new_annotations_filename
+                if renamed:
+                    with open(os.path.join(self.root_dir, DATA_DIR, new_dataset_filename), 'w') as df:
+                        json.dump(cfg1, df)
+                    datasets_config['datasets'][dataset_id] = ds1.get_config_filename()
+            
+        with open(os.path.join(root_dir, DATA_DIR, self.DATASETS_FILE), 'w') as df:
+            json.dump(datasets_config, df)
+        if self.__enter:
+            return
+        for dataset in self.datasets:
+            dataset.dump(root_dir, datasets_config['datasets'][str(dataset.id)])
+        
     @staticmethod
     def load(root_dir: os.PathLike, filename: str) -> 'DataDatabase':
         raise RuntimeError("Use DataDatabase(root_dir) instead of load")
+    
+    def __enter__(self) -> 'DataDatabase':
+        self.__enter = True
+        self.__exit_stack = contextlib.ExitStack()
+        for dataset in self.datasets:
+            self.__exit_stack.enter_context(dataset(self.root_dir))
+        # for experiment in self.experiments:
+        #     self.__exit_stack.enter_context(experiment(self.root_dir))
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.__enter = False
+        self.__exit_stack.close()
+        self.dump(self.root_dir)
+

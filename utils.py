@@ -15,7 +15,7 @@ class Stringifiable(ABC):
 
 class Dumpable(ABC):
     @abstractmethod
-    def dump(self, root_dir: os.PathLike, filename: str | None = None): # TODO do not rewrite 
+    def dump(self, root_dir: os.PathLike, filename: str | None = None): # TODO:  do not rewrite 
         pass
 
     @abstractmethod

@@ -13,6 +13,7 @@ import os
 import json
 import itertools
 import functools
+from typing import Self
 
 @dataclasses.dataclass
 class ExperimentHistory(JSONifiable):
@@ -101,6 +102,7 @@ class Experiment(Dumpable):
         self.root_dir = root_dir
         self.name = name if name is not None else f"{dataset.get_id()}_cs={cold_start_strategy}_al={active_learning_strategy}_{pool}"
         self.__history = None
+        self.__database: database.DataDatabase | None = None
 
     def get_config_filename(self, external_id: str | None = None) -> str:
         if external_id is not None:
@@ -163,6 +165,10 @@ class Experiment(Dumpable):
         experiment.__history = ExperimentHistory.from_json(history_json)
         return experiment
 
+    def __call__(self, database: database.DataDatabase | None = None) -> 'Experiment':
+        self.__database = database
+        return self
+    
     def __enter__(self) -> 'Experiment':
         return self
     
@@ -171,7 +177,9 @@ class Experiment(Dumpable):
             print("Warning: Experiment was not run, no history to save.")
         else:
             self.dump()
-
+            if self.__database is not None:
+                self.__database.register(self)
+               
     @property
     def budget(self) -> int:
         return self.cold_start_strategy.budget + self.active_learning_strategy.budget + 1 # +1 for dirty hack
@@ -186,15 +194,19 @@ class Experiment(Dumpable):
             raise ValueError("Experiment history is not available. Run the experiment first.")
         return self.__history
     
-    def run(self, tokenizer: BertTokenizerFast, fine_tuning_model: str, *, force: bool = False):
-        if os.path.exists(os.path.join(self.root_dir, database.DATA_DIR, self.get_config_filename())) and not force:
-            with open(os.path.join(self.root_dir, database.DATA_DIR, self.get_config_filename()), 'r') as ef:
-                config = json.load(ef)
-            if self.__history is None and os.path.exists(os.path.join(self.root_dir, config['history'])):
-                with open(os.path.join(self.root_dir, config['history']), 'r') as hf:
-                    history_json = json.load(hf)
-                self.__history = ExperimentHistory.from_json(history_json)
-                return
+    def run(self, tokenizer: BertTokenizerFast, fine_tuning_model: str):
+        # if database is not None and self in database.experiments and not force:
+        #     self.__history = database.experiments[self].history
+        #     return
+        
+        # if os.path.exists(os.path.join(self.root_dir, database.DATA_DIR, self.get_config_filename())) and not force:
+        #     with open(os.path.join(self.root_dir, database.DATA_DIR, self.get_config_filename()), 'r') as ef:
+        #         config = json.load(ef)
+        #     if self.__history is None and os.path.exists(os.path.join(self.root_dir, config['history'])):
+        #         with open(os.path.join(self.root_dir, config['history']), 'r') as hf:
+        #             history_json = json.load(hf)
+        #         self.__history = ExperimentHistory.from_json(history_json)
+        #         return
     
         print(f"=== RUNNING EXPERIMENT: {self.name} ===")
         num_classes = len(set(self.dataset.dataset.train[self.dataset.label_field]))
@@ -306,6 +318,19 @@ class Experiments(JSONifiable):
                 (self.al_strategy is None or other.al_strategy is None or self.al_strategy == other.al_strategy)
             )
         
+        def __eq__(self, value):
+            if not isinstance(value, Experiments.ExperimentKey):
+                return False
+            return (
+                self.dataset_id == value.dataset_id and self.dataset_id is not None and
+                self.pool_size == value.pool_size and self.pool_size is not None and
+                self.seed == value.seed and self.seed is not None and
+                self.split == value.split and self.split is not None and
+                self.budget == value.budget and self.budget is not None and
+                self.cs_strategy == value.cs_strategy and   self.cs_strategy is not None and
+                self.al_strategy == value.al_strategy and self.al_strategy is not None
+            )
+        
         def to_json(self) -> dict:
             return {
                 'dataset_id': str(self.dataset_id),
@@ -326,7 +351,7 @@ class Experiments(JSONifiable):
                 split=data['split'],
                 budget=data['budget'],
                 cs_strategy=strategies.ColdStartStrategy.from_str(data['cs_strategy']),
-                al_strategy=strategies.QueryStrategyType.from_str(data['al_strategy']), # TODO: implrment generic subclass instantion
+                al_strategy=strategies.QueryStrategyType.factory_from_str(data['al_strategy']),
             )
 
     @dataclasses.dataclass(eq=True)
@@ -346,6 +371,7 @@ class Experiments(JSONifiable):
             Experiments.ExperimentKey.from_experiment(exp): (exp, i, Experiments.ExperimentInfo()) 
             for i, exp in enumerate(experiments)
         }
+        self.database: database.DataDatabase | None = None
 
     def __iter__(self):
         return iter(self.experiments)
@@ -358,6 +384,26 @@ class Experiments(JSONifiable):
         self.experiments = [exp for exp, _, _ in sorted(self.__experiments_map.values(), key=lambda x: x[1])]
         return self
     
+    def set(self, obj: database.DataDatabase | Experiment) -> Self:
+        if isinstance(obj, database.DataDatabase):
+            self.database = obj
+        elif isinstance(obj, Experiment):
+            key = Experiments.ExperimentKey.from_experiment(obj)
+            if key not in self.__experiments_map:
+                self.add(obj)
+            else:
+                _, index, info = self.__experiments_map[key]
+                self.experiments[index] = obj
+                self.__experiments_map[key] = (obj, index, info)
+        return self
+
+    def add(self, experiment: Experiment):
+        key = Experiments.ExperimentKey.from_experiment(experiment)
+        if key in self.__experiments_map:
+            raise ValueError("Experiment already exists in the collection")
+        self.experiments.append(experiment)
+        self.__experiments_map[key] = (experiment, len(self.experiments) - 1, Experiments.ExperimentInfo())
+              
     @staticmethod
     def from_experiments(*experiments: 'Experiments') -> 'Experiments':
         return functools.reduce(lambda acc, exp: acc.merge(exp), experiments, Experiments())
@@ -389,18 +435,29 @@ class Experiments(JSONifiable):
             )
         ))
     
+    def cached(self, experiment: Experiment) -> bool:
+        return self.database is not None and experiment in self.database
+
     def run_all(self, tokenizer: BertTokenizerFast, fine_tuning_model: str, *, default_force: bool = False): 
         for experiment in self.experiments:
             experiment_info = self.__experiments_map[Experiments.ExperimentKey.from_experiment(experiment)][2]
             force = default_force if experiment_info.force is None else experiment_info.force
-            with experiment:
-                experiment.run(tokenizer, fine_tuning_model, force=force)
+            if self.cached(experiment) and not force:
+                self.set(experiment.database.load(experiment)) 
+            else:
+                with experiment(self.database):
+                    experiment.run(tokenizer, fine_tuning_model, force=force, database=self.database)
 
     def __get_item__(self, key: 'Experiments.ExperimentKey') -> tuple[Experiment, int, 'Experiments.ExperimentInfo']:
         matching = {e for e in self.__experiments_map.keys() if e.equivalent(key)}
         if len(matching) != 1:
             raise KeyError(f"Key {key} is ambiguous, matches {len(matching)} experiments")
         return self.__experiments_map[matching.pop()]
+    
+    def __contains__(self, key: 'Experiments.ExperimentKey' | Experiment) -> bool:
+        if isinstance(key, Experiment):
+            key = Experiments.ExperimentKey.from_experiment(key)
+        return any(e == key for e in self.__experiments_map.keys())
     
     def matching(self, key: 'Experiments.ExperimentKey') -> set[tuple[Experiment, int, 'Experiments.ExperimentInfo']]:
         return {self.__experiments_map[e] for e in self.__experiments_map.keys() if e.equivalent(key)}
@@ -440,3 +497,4 @@ class Experiments(JSONifiable):
             ) 
             for _, exp_data in sorted(data['experiments'].items(), key=lambda x: int(x[0]))
         ))
+

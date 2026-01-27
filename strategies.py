@@ -19,6 +19,7 @@ import dataclasses
 import datetime
 from abc import ABC, abstractmethod
 import time
+import itertools
 
 def evaluate_on_test(active_learner: PoolBasedActiveLearner, test_dataset: TransformersDataset) -> tuple[float, float]:
     y_pred = active_learner.classifier.predict(test_dataset)
@@ -45,13 +46,28 @@ class QueryStrategyType(ABC, Stringifiable):
     def run_loop(self, pool: database.DatasetView, active_learner: PoolBasedActiveLearner, indices_labeled: npt.NDArray[np.int64], test_dataset: TransformersDataset, n_iterations: int, batch_size: int) -> tuple[float, float, datetime.timedelta, npt.NDArray[np.int64]]:
         pass
     
+    @classmethod
+    def __get_all_subclasses(cls) -> list:
+        return cls.__subclasses__() + list(itertools.chain.from_iterable(
+            subcls.__get_all_subclasses() for subcls in cls.__subclasses__()
+        ))
+
     def __str__(self) -> str:
         return self.query_strategy_name()
 
     @abstractmethod
-    @staticmethod
+    @staticmethod 
     def from_str(s: str) -> 'QueryStrategyType':
         pass
+
+    @classmethod
+    def factory_from_str(cls, s: str) -> 'QueryStrategyType':
+        for subclass in cls.__get_all_subclasses():
+            try:
+                return subclass.from_str(s)
+            except ValueError:
+                continue
+        raise ValueError(f"Unknown QueryStrategyType string: {s}")
 
 class SimpleQueryStrategyType(enum.Enum, Stringifiable):
     RANDOM = enum.auto()
@@ -79,6 +95,8 @@ class SimpleQueryStrategyType(enum.Enum, Stringifiable):
     
     @classmethod
     def from_str(cls: 'SimpleQueryStrategyType', strategy_str: str) -> 'SimpleQueryStrategyType':
+        if strategy_str not in cls.REVERSE_STR_MAPPINGS:
+            raise ValueError(f"Unknown SimpleQueryStrategyType string: {strategy_str}")
         return cls.REVERSE_STR_MAPPINGS[strategy_str]
     
     def to_query_strategy(self, num_classes: int) -> QueryStrategy:
