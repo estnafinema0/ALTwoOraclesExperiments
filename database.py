@@ -210,12 +210,12 @@ class Dataset(Dumpable, JSONifiable):
             for llm_str, label_file in config['annotations'].items()
         }
 
-    def get_config_filename(self, external_id: str | None = None) -> str:
+    def get_config_filename(self, external_id: None = None) -> str:
         if external_id is not None:
             raise ValueError("external_id can not be provided for Dataset")
         return f"{str(self.id)}.json"
     
-    def get_config(self, external_id: str | None = None) -> dict:
+    def get_config(self, external_id: None = None) -> dict:
         if external_id is not None:
             raise ValueError("external_id can not be provided for Dataset")
         config = {

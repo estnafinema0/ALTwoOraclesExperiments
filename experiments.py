@@ -104,12 +104,12 @@ class Experiment(Dumpable):
         self.__history = None
         self.__database: database.DataDatabase | None = None
 
-    def get_config_filename(self, external_id: str | None = None) -> str:
+    def get_config_filename(self, external_id: None = None) -> str:
         if external_id is not None:
             raise ValueError("External ID is not supported for Experiment config filename")
         return f"{self.name}_experiment.json" 
     
-    def get_config(self, external_id: str | None = None):
+    def get_config(self, external_id: None = None):
         if external_id is not None:
             raise ValueError("External ID is not supported for Experiment config")
         if self.__history is None:
