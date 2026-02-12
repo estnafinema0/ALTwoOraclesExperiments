@@ -1,49 +1,46 @@
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, ABCMeta
+import enum
 from typing import Self
-import os
+import pathlib
+import dataclasses
 
-class Stringifiable(ABC):
-    @abstractmethod
-    def __str__(self) -> str:
-        pass
+def open_subbuild(*parts) -> pathlib.Path:
+    path = pathlib.Path(*parts)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+class Constant:
+    def __init__(self, value):
+        self.value = value
     
-    @abstractmethod
-    @staticmethod
-    def from_str(s: str) -> Self:
-        pass
+    def __get__(self, *args):
+        return self.value
+    
+    def __getattr__(self, name):
+        return getattr(self.value, name)
+    
+    def __getitem__(self, key):
+        return self.value[key]
+    
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.value})"
 
-class Dumpable(ABC):
-    @abstractmethod
-    def dump(self, root_dir: os.PathLike, filename: str | None = None): # TODO:  do not rewrite 
-        pass
+class EnumABCMeta(ABCMeta, enum.EnumMeta):   
+    pass 
 
-    @abstractmethod
-    @staticmethod
-    def load(root_dir: os.PathLike, filename: str) -> Self:
-        pass
+    # @abstractmethod
+    # def dump(self, root_dir: pathlib.Path, filename: str | None = None): # TODO:  do not rewrite 
+    #     pass
 
-    @abstractmethod
-    def __enter__(self) -> Self:
-        pass
+    # @staticmethod
+    # @abstractmethod
+    # def load(root_dir: pathlib.Path, filename: str) -> Self:
+    #     pass
 
-    @abstractmethod
-    def __exit__(self, exc_type, exc_value, traceback):
-        pass
+    # @abstractmethod
+    # def __enter__(self) -> Self:
+    #     pass
 
-    @abstractmethod
-    def get_config(self, external_id: str | None = None) -> dict:
-        pass
-
-    @abstractmethod
-    def get_config_filename(self, external_id: str | None = None) -> str:
-        pass
-
-class JSONifiable(ABC):
-    @abstractmethod
-    def to_json(self) -> dict:
-        pass
-
-    @abstractmethod
-    @staticmethod
-    def from_json(data: dict) -> Self:
-        pass
+    # @abstractmethod
+    # def __exit__(self, exc_type, exc_value, traceback):
+    #     pass

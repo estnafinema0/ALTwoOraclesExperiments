@@ -1,679 +1,843 @@
-from utils import Stringifiable, Dumpable, JSONifiable
+from utils import EnumABCMeta, open_subbuild
+import storage
 import experiments
-
 from transformers.models.bert.tokenization_bert_fast import BertTokenizerFast
 from small_text.integrations.transformers.datasets import TransformersDataset
 import datasets
 import numpy as np
 import numpy.typing as npt
 
+import hashlib
+import re
 import dataclasses
+import pathlib
+import functools
 import enum
-import os
 import json
 import uuid
 import contextlib
-from typing import Iterable
+from typing import Iterable, Self, Protocol
 
-DATA_DIR = 'data'
 
-class Indices(Dumpable):
-    def __init__(self, indices: npt.NDArray[np.int64], repr: dict[str, any] | None):
+class Indices(storage.Storable):
+    def __init__(self, indices: npt.NDArray[np.int64]):
         self.indices = indices
-        self.repr = repr
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    # def dump(self, root_dir: pathlib.Path, external_id: str, filename: str | None = None):
+    #     config = self.get_config(external_id)
+    #     if config["hardcoded"]:
+    #         np.save(root_dir / config["indices_file"], self.indices)
+
+    #     with open_subbuild(
+    #         root_dir / storage.DATA_DIR / (filename if filename is not None else self.get_config_filename(external_id))
+    #     ).open("w") as cfg:
+    #         json.dump(config, cfg)
+
+    # @staticmethod
+    # def load(root_dir: pathlib.Path, filename: str) -> "Indices":
+    #     with open_subbuild(root_dir / storage.DATA_DIR / filename).open("r") as cfg:
+    #         config = json.load(cfg)
+    #     if config["hardcoded"]:
+    #         indices = np.load(root_dir / config["indices_file"])
+    #         return Indices(indices=indices, repr=None)
+    #     else:
+    #         return Indices.from_seed(**config["repr"])
+
+
+class SeededIndices(Indices):
+    def __init__(self, size: int, seed: int, dataset_size: int):
+        indices = np.arange(dataset_size)
+        rng = np.random.default_rng(seed)
+        rng.shuffle(indices)
+        super().__init__(indices=indices[:size])
+        self.size = size
+        self.seed = seed
+        self.dataset_size = dataset_size
+
+    @staticmethod
+    def _get_salt(size: int, seed: int, dataset_size: int) -> storage.Hash:
+        return storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, (size, seed, dataset_size))))
+
+    def get_id(self) -> storage.ID:
+        return f"{self.seed}_{self.size}_{self.dataset_size}#{self._get_salt(self.size, self.seed, self.dataset_size)}"
+
+    def as_storable(self) -> storage.StorableBundle:
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): storage.StorableEntry(
+                    payload={
+                        "seed": self.seed,
+                        "size": self.size,
+                        "dataset_size": self.dataset_size,
+                    },
+                    type=storage.StorableType.SEEDED_INDICES,
+                    id=self.get_id(),
+                ),
+            },
+        )
+
+
+@dataclasses.dataclass(frozen=True, eq=True, slots=True)
+class DatasetID(storage.Stringifiable):
+    path: str
+    subset: str | None = None
+
+    STR_PATTERN = re.compile(r"(?P<path>[a-zA-Z0-9_]+(-[a-zA-Z0-9_]+)*)_(?P<subset>([a-zA-Z0-9_]+)?)")
+
+    def __str__(self) -> str:
+        return f"{self.path.replace('/', '-')}_{[self.subset, ''][self.subset is None]}"
+
+    @staticmethod
+    def from_str(id_str: str) -> "DatasetID":
+        m = re.fullmatch(DatasetID.STR_PATTERN, id_str)
+        if m is None:
+            raise ValueError(f"Invalid DatasetID string: {id_str}")
+        path = m.group("path").replace("-", "/")
+        subset = m.group("subset") or None
+        return DatasetID(path=path, subset=subset)
+
+
+class LLMType(storage.Stringifiable, enum.Enum, metaclass=EnumABCMeta):
+    GIGACHAT = enum.auto()
+
+    @classmethod
+    def str_mappings(cls) -> dict[Self, str]:
+        return {
+            cls.GIGACHAT: "gigachat",
+        }
+
+    @classmethod
+    def reverse_str_mappings(cls) -> dict[str, Self]:
+        return {v: k for k, v in cls.str_mappings().items()}
+
+    def __str__(self) -> str:
+        return self.str_mappings()[self]
+
+    @classmethod
+    def from_str(cls: "LLMType", strategy_str: str) -> "LLMType":
+        return cls.reverse_str_mappings()[strategy_str]
+
+
+@dataclasses.dataclass
+class LLMLabels(storage.Storable):  # TODO: consider pool mapping
+    dataset_id: DatasetID
+    llm: LLMType
+    labels: npt.NDArray[np.int64]
+
+    def get_id(self) -> storage.ID:
+        return f"{self.dataset_id}__{self.llm}#{self._get_salt(self.dataset_id, self.llm)}"
+
+    @staticmethod
+    def _get_salt(dataset_id: DatasetID, llm: LLMType) -> storage.Hash:
+        return storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, (dataset_id, llm))))
+
+    def as_storable(self) -> storage.StorableBundle:
+        salt = self._get_salt(self.dataset_id, self.llm)
+        array_id = f"{salt}_1#{hash((salt, 1))}"
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): storage.StorableEntry(
+                    payload={
+                        "llm": str(self.llm),
+                        "labels": array_id,
+                    },
+                    type=storage.StorableType.LLM_LABELS,
+                ),
+                array_id: storage.StorableEntry.from_npy(self.labels),
+            },
+        )
+
+    # def dump(self, root_dir: pathlib.Path, external_id: str, filename: str | None = None):
+    #     config = self.get_config(external_id)
+    #     with (
+    #         open_subbuild(
+    #             root_dir / storage.DATA_DIR / (filename if filename is not None else self.get_config_filename(external_id))
+    #         ).open("w") as cfg,
+    #         open_subbuild(root_dir / config["labels"]).open("wb") as lf,
+    #     ):
+    #         json.dump(config, cfg)
+    #         np.save(lf, self.labels)
+
+    # @staticmethod
+    # def load(root_dir: pathlib.Path, filename: str) -> "LLMLabels":
+    #     with (root_dir / storage.DATA_DIR / filename).open("r") as cfg:
+    #         config = json.load(cfg)
+    #     return LLMLabels(llm=LLMType.from_str(config["llm"]), labels=np.load(root_dir / config["labels"]))
+
+    def __eq__(self, value):
+        if not isinstance(value, LLMLabels):
+            return False
+        return (
+            self.llm == value.llm and np.array_equal(self.labels, value.labels) and self.dataset_id == value.dataset_id
+        )
+
+
+class Dataset(Protocol):
+    def __init__(self, dataset: datasets.Dataset, base: "CompleteDataset"):
+        self.dataset = dataset
+        self.base = base
+        self.annotations = ...
+        self.__y = None
+        self.__x = None
+
+    @property
+    def y(self) -> npt.NDArray[np.int64]:
+        if self.__y is None:
+            self.__y = np.array(self.dataset["label"], dtype=np.int64)
+        return self.__y
+
+    @property
+    def x(self) -> npt.NDArray[np.str_]:
+        if self.__x is None:
+            self.__x = np.array(self.dataset["text"], dtype=np.str_)
+        return self.__x
+
+    @property
+    def size(self) -> int:
+        return len(self.dataset)
+
+    def __len__(self) -> int:
+        return self.size
+
+    def to_transformers_dataset(
+        self, tokenizer: BertTokenizerFast, num_classes: int, max_length: int = 128
+    ) -> TransformersDataset:
+        return TransformersDataset.from_arrays(
+            self.x,
+            self.y,
+            tokenizer,
+            target_labels=np.arange(num_classes, dtype=np.int64),
+            max_length=max_length,
+        )
+
+
+class Pool(storage.Storable):
+    def __init__(self, indices: Indices, dataset: Dataset):
+        self.indices = indices
+        self.dataset = dataset
+        self.__y = None
+        self.__x = None
+
+    @property
+    def y(self) -> npt.NDArray[np.int64]:
+        if self.__y is None:
+            self.__y = self.dataset.y[self.indices.indices]
+        return self.__y
+
+    @property
+    def x(self) -> npt.NDArray[np.str_]:
+        if self.__x is None:
+            self.__x = self.dataset.x[self.indices.indices]
+        return self.__x
+
+    @property
+    def base(self) -> "CompleteDataset":
+        return self.dataset.base
 
     @property
     def size(self) -> int:
         return len(self.indices)
-    
-    @staticmethod
-    def from_seed(*, size: int, seed: int, dataset_size: int) -> 'Indices':
-        rng = np.random.default_rng(seed)
-        indices = np.arange(dataset_size)
-        rng.shuffle(indices)
-        return Indices(indices=indices[:size], repr={"seed": seed, "size": size, "dataset_size": dataset_size})
 
-    def get_config_filename(self, external_id: str) -> str:
-        return f"{external_id}_indices.json"
-    
-    def get_config(self, external_id: str) -> dict:
-        config = {
-            'hardcoded': self.repr is None, 
-        }
-        if self.repr is not None:
-            config['repr'] = self.repr
-        else:
-            indices_file =  os.path.join(DATA_DIR, f"{external_id}_indices.dat") 
-            config['indices_file'] = indices_file
-        return config
-
-    def dump(self, root_dir: os.PathLike, external_id: str, filename: str | None = None):
-        config = self.get_config(external_id)
-        if config['hardcoded']:
-            np.save(os.path.join(root_dir, config['indices_file']), self.indices)
-
-        with open(os.path.join(root_dir, DATA_DIR, filename if filename is not None else self.get_config_filename(external_id)), 'w') as cfg:
-            json.dump(config, cfg)
+    def __len__(self) -> int:
+        return self.size
 
     @staticmethod
-    def load(root_dir: os.PathLike, filename: str) -> 'Indices':
-        with open(os.path.join(root_dir, DATA_DIR, filename), 'r') as cfg:
-            config = json.load(cfg)
-        if config['hardcoded']:
-            indices = np.load(os.path.join(root_dir, config['indices_file']))
-            return Indices(indices=indices, repr=None)
-        else:
-            return Indices.from_seed(**config['repr'])
-        
-    def __call__(self, root_dir: os.PathLike, filename: str) -> 'Indices':
-        self.__filename = filename
-        self.__root_dir = root_dir
-        return self
-    
-    def __enter__(self) -> 'Indices':
-        return self
-    
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.__root_dir is None or self.__filename is None:
-            print("Warning: cannot dump Indices on exit")
-        else:
-            self.dump(self.__root_dir, self.__filename)
+    def _get_salt(dataset_id: DatasetID, indices_id: storage.ID) -> storage.Hash:
+        return storage.Storable.combine_hashes(
+            storage.Storable.hash_str(str(dataset_id)), storage.Storable.hash_str(indices_id)
+        )
 
-@dataclasses.dataclass(frozen=True, eq=True)
-class DatasetID(Stringifiable):
-    path: str
-    subset: str | None = None
+    def get_id(self) -> storage.ID:
+        return f"{self.base.id}__{self.indices.get_id()}#{self._get_salt(self.base.id, self.indices.get_id())}"
 
-    def __str__(self) -> str:
-        if self.subset is None:
-            return self.path
-        return f"{self.path.replace('/', '_')} {self.subset}"
-    
-    @staticmethod
-    def from_str(id_str: str) -> 'DatasetID':
-        if not id_str.endswith('None'):
-            parts = id_str.split(' ')
-            path = parts[0].replace('_', '/')
-            subset = parts[-1]
-            return DatasetID(path=path, subset=subset)
-        else:
-            return DatasetID(path=id_str, subset=None)
-        
-    
-class LLMType(enum.Enum, Stringifiable):
-    GIGACHAT = enum.auto()
+    def as_storable(self) -> storage.StorableBundle:
+        indices_entry = self.indices.as_storable()
+        dataset_entry = storage.StorableEntry(
+            payload={
+                "dataset_id": str(self.base.id),
+                "indices": self.indices.get_id(),
+            },
+            type=storage.StorableType.POOL,
+            id=self.get_id(),
+        )
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): dataset_entry,
+                **indices_entry.entries,
+            },
+        )
 
-    STR_MAPPINGS = {
-        GIGACHAT: "gigachat",
-    }
+    def to_transformers_dataset(
+        self, tokenizer: BertTokenizerFast, num_classes: int, max_length: int = 128
+    ) -> TransformersDataset:
+        return TransformersDataset.from_arrays(
+            self.x,
+            self.y,
+            tokenizer,
+            target_labels=np.arange(num_classes, dtype=np.int64),
+            max_length=max_length,
+        )
 
-    REVERSE_STR_MAPPINGS = {v: k for k, v in STR_MAPPINGS.items()}
+    def __repr__(self) -> str:
+        return f"Pool(dataset_id={self.base.id}, indices={self.indices.indices})"
 
-    def __str__(self) -> str:
-        return self.STR_MAPPINGS[self]
-    
-    @classmethod
-    def from_str(cls: 'LLMType', strategy_str: str) -> 'LLMType':
-        return cls.REVERSE_STR_MAPPINGS[strategy_str]
+    # @property
+    # def annotations(self) -> dict[LLMType, LLMLabels]:
+    #     if self.__annotations is not None:
+    #         return self.__annotations
+    #     if self.dataset is not None:
+    #         all_annotations = self.dataset.annotations
+    #         self.__annotations = {}
+    #         for llm, labels in all_annotations.items():
+    #             pool_labels = labels.labels[self.indices.indices]
+    #             self.__annotations[llm] = LLMLabels(llm=llm, labels=pool_labels)
+    #         return self.__annotations
+    #     raise ValueError("Cannot get annotations without base dataset")
+
+    # def dump(self, root_dir: pathlib.Path, external_id: str, filename: str | None = None):
+    #     config = self.get_config(external_id)
+    #     with open_subbuild(
+    #         root_dir / storage.DATA_DIR / (filename if filename is not None else self.get_config_filename(external_id))
+    #     ).open("w") as cfg:
+    #         json.dump(config, cfg)
+    #     self.indices.dump(root_dir, external_id)
+    #     for key, file in config["pool_files"].items():
+    #         self.pool.dataset[key].save_to_disk(root_dir / file)
+    #     for llm, file in config["annotations"].items():
+    #         self.annotations[LLMType.from_str(llm)].dump(root_dir, external_id)
+
+    # @staticmethod
+    # def load(root_dir: pathlib.Path, filename: str, dataset: CompleteDataset | None = None) -> "Pool":
+    #     config_path = filename if filename.is_absolute() else root_dir / filename
+    #     with config_path.open("r") as cfg:
+    #         config = json.load(cfg)
+    #     indices_file = pathlib.Path(config["indices_file"])
+
+    #     if indices_file.parents[-2] == storage.DATA_DIR:
+    #         indices_file = indices_file.relative_to(storage.DATA_DIR)
+    #     indices = Indices.load(root_dir, indices_file)
+    #     pool_data = datasets.DatasetDict()
+    #     for key, file in config["pool_files"].items():
+    #         pool_data[key] = datasets.Dataset.load_from_disk(root_dir / file)
+    #     pool = Pool(indices=indices, dataset=dataset)
+    #     pool.__pool = pool_data
+    #     pool.__annotations = {
+    #         LLMType.from_str(llm_str): LLMLabels.load(
+    #             root_dir,
+    #             (
+    #                 pathlib.Path(label_file).relative_to(storage.DATA_DIR)
+    #                 if pathlib.Path(label_file).parents[-2] == storage.DATA_DIR
+    #                 else label_file
+    #             ),
+    #         )
+    #         for llm_str, label_file in config["annotations"].items()
+    #     }
+    #     return pool
 
 
-@dataclasses.dataclass
-class LLMLabels(Dumpable):
-    llm: LLMType
-    labels: npt.NDArray[np.int64]
-    
-    @staticmethod
-    def id_to_file_name(ID: str, llm: LLMType) -> str:
-        return f"{ID}_{llm}"
-
-    def get_config_filename(self, external_id: str):
-        return f"{LLMLabels.id_to_file_name(external_id, self.llm)}.json"
-    
-    def get_config(self, external_id: str) -> dict:
-        label_file =  os.path.join(DATA_DIR, f"{LLMLabels.id_to_file_name(external_id, self.llm)}.dat") 
-        config = {
-            'llm': str(self.llm), 
-            'labels': label_file, 
-        }
-        return config
-    
-    def dump(self, root_dir: os.PathLike, external_id: str, filename: str | None = None):
-        config = self.get_config(external_id)
-        with (open(os.path.join(root_dir, DATA_DIR, filename if filename is not None else self.get_config_filename(external_id)), 'w') as cfg,
-               open(os.path.join(root_dir, config['labels']), 'wb') as lf
-               ):
-            json.dump(config, cfg)
-            np.save(lf, self.labels)
-
-    @staticmethod
-    def load(root_dir: os.PathLike, filename: str) -> 'LLMLabels':
-        with open(os.path.join(root_dir, DATA_DIR, filename), 'r') as cfg:
-            config = json.load(cfg)
-        return LLMLabels(llm=LLMType.from_str(config['llm']), labels=np.load(os.path.join(root_dir, config['labels'])) )
-    
-    def __eq__(self, value):
-        if not isinstance(value, LLMLabels):
-            return False
-        return self.llm == value.llm and np.array_equal(self.labels, value.labels)
-    
-    def __call__(self, root_dir: os.PathLike, filename: str) -> 'LLMLabels':
-        self.__filename = filename
-        self.__root_dir = root_dir
-        return self 
-    
-    def __enter__(self) -> 'LLMLabels':
-        return self
-    
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.__root_dir is None or self.__filename is None:
-            print("Warning: cannot dump LLMLabels on exit")
-        else:
-            self.dump(self.__root_dir, self.__filename)
-
-class Dataset(Dumpable, JSONifiable):
-    def __init__(self, id: DatasetID, text_field: str, label_field: str):
+class CompleteDataset(storage.Storable):
+    def __init__(self, id: DatasetID, text_field: str, label_field: str):  # TODO: pass storage object
         self.id = id
         self.text_field = text_field
         self.label_field = label_field
         self.__dataset = None
         self.__annotations = None
-    
+        self.__train = None
+        self.__validation = None
+        self.__pool = None
+
     @property
-    def dataset(self) -> 'DatasetView': 
-        return DatasetView(self)
-    
-    def to_small_text(self) -> datasets.DatasetDict:
+    def annotations(self) -> dict[LLMType, LLMLabels]:  # TODO: pass storage object
+        if self.__annotations is not None:
+            return self.__annotations
+        self.__annotations = {}
+        dataset_file = self.__root_dir / storage.DATA_DIR / self.get_config_filename()
+        if dataset_file.exists():
+            with dataset_file.open("r") as df:
+                config = json.load(df)
+            self.__load_annotations(config)
+        return self.__annotations
+
+    def __load_annotations(self, config: dict):
+        self.__annotations = {
+            LLMType.from_str(llm_str): LLMLabels.load(self.__root_dir, label_file)
+            for llm_str, label_file in config["annotations"].items()
+        }
+
+    @property
+    def train(self) -> Dataset:
+        if self.__train is None:
+            self.__train = Dataset(self.internal["train"], self)
+        return self.__train
+
+    @property
+    def validation(self) -> Dataset:
+        if self.__validation is None:
+            self.__validation = Dataset(self.internal.get("validation", self.internal["test"]), self)
+        return self.__validation
+
+    @property
+    def internal(self) -> datasets.DatasetDict:
         if self.__dataset is not None:
             return self.__dataset
         if self.id.subset is None:
             self.__dataset = datasets.load_dataset(self.id.path)
         else:
             self.__dataset = datasets.load_dataset(self.id.path, self.id.subset)
-        self.__dataset = Dataset.__standardize_dataset(self.__dataset, self.text_field, self.label_field)
-        return self.__dataset 
-    
+        self.__dataset = self.__standardize_dataset(self.__dataset)
+        return self.__dataset
+
+    def create_pool(self, indices: Indices) -> Pool:
+        if self.__pool is not None:
+            print("[WARNING]: Pool already exists for this dataset, overwriting")
+        self.__pool = Pool(indices=indices, dataset=self.train)
+        return self.__pool
+
     @property
-    def annotations(self) ->  dict[LLMType, LLMLabels]:
-        if self.__annotations is not None:
-            return self.__annotations
-        self.__annotations = {}
-        dataset_file = os.path.join(self.root_dir, DATA_DIR, self.get_config_filename())
-        if os.path.exists(dataset_file):
-            with open(dataset_file, 'r') as df:
-                config = json.load(df)
-            self.__load_annotations(config)
-        return self.__annotations
-    
-    def __load_annotations(self, config: dict):
-        self.__annotations = {
-            LLMType.from_str(llm_str): LLMLabels.load(self.root_dir, label_file)
-            for llm_str, label_file in config['annotations'].items()
-        }
-
-    def get_config_filename(self, external_id: None = None) -> str:
-        if external_id is not None:
-            raise ValueError("external_id can not be provided for Dataset")
-        return f"{str(self.id)}.json"
-    
-    def get_config(self, external_id: None = None) -> dict:
-        if external_id is not None:
-            raise ValueError("external_id can not be provided for Dataset")
-        config = {
-            'id': str(self.id),
-            'annotations': {
-                str(llm): os.path.join(DATA_DIR, labels.get_config_filename(str(self.id))) 
-                for llm, labels in self.annotations.items()
-            } if self.__annotations is not None else {},
-            'text_field': self.text_field,
-            'label_field': self.label_field,
-        }       
-        return config
-    
-    def dump(self, root_dir: os.PathLike, filename: str | None = None):
-        config = self.get_config()
-        with open(os.path.join(
-                        root_dir, 
-                        DATA_DIR, 
-                        filename if filename is not None else self.get_config_filename()
-                    ), 'w') as df:
-            json.dump(config, df)
-        for labels in self.annotations.values():  
-            labels.dump(root_dir, str(self.id))
+    def pool(self) -> Pool:
+        if self.__pool is None:
+            raise ValueError("Firstly create pool via Dataset.create_pool method")
+        return self.__pool
 
     @staticmethod
-    def load(root_dir: os.PathLike, filename: str) -> 'Dataset':
-        with open(os.path.join(root_dir, filename), 'r') as df:
-            config = json.load(df)
-        dataset = Dataset(
-            id=DatasetID.from_str(config['id']),
-            text_field=config['text_field'],
-            label_field=config['label_field'],
+    def _get_salt(dataset_id: DatasetID) -> storage.Hash:
+        return storage.Storable.hash_str(str(dataset_id))
+
+    def get_id(self) -> storage.ID:
+        return f"{self.id}#{self._get_salt(self.id)}"
+
+    def as_storable(self) -> storage.StorableBundle:  # TODO: annotations
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): storage.StorableEntry(
+                    payload={
+                        "text_field": self.text_field,
+                        "label_field": self.label_field,
+                        "dataset": str(self.id),
+                    },
+                    type=storage.StorableType.DATASET,
+                    id=self.get_id(),
+                ),
+            },
         )
-        dataset.__load_annotations(config)
-        return dataset
-    
-    def __call__(self, root_dir: os.PathLike, filename: str | None = None) -> 'Dataset':
-        self.__root_dir = root_dir
-        self.__filename = filename
-        return self
-    
-    def __enter__(self) -> 'Dataset':
-        return self
-    
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.__root_dir is None:
-            print("Warning: cannot dump Dataset on exit")
-        else:
-            self.dump(self.__root_dir, self.__filename)
 
-    @staticmethod
-    def __standardize_dataset(dataset: datasets.DatasetDict, text_field: str, label_field: str) -> datasets.DatasetDict:
+    def __standardize_dataset(self, dataset: datasets.DatasetDict) -> datasets.DatasetDict:
         return dataset.map(
             lambda ex: {
-                "text": ex[text_field],
-                "label": ex[label_field],
+                "text": ex[self.text_field],
+                "label": ex[self.label_field],
             },
             remove_columns=dataset["train"].column_names,
         )
 
-    def to_json(self) -> dict:
-        return {
-            'id': str(self.id),
-            'text_field': self.text_field,
-            'label_field': self.label_field,
-        }
-    
-    @staticmethod
-    def from_json(data: dict) -> 'Dataset':
-        return Dataset(
-            id=DatasetID.from_str(data['id']),
-            text_field=data['text_field'],
-            label_field=data['label_field'],
-        )
-    
-class Pool(Dumpable):
-    def __init__(self, indices: Indices, dataset: Dataset | None):
-        self.indices = indices
-        self.__dataset = dataset
-        self.__pool = None
-        self.__annotations = None
-    
-    @property
-    def base_dataset(self) -> Dataset | None:
-        return self.__dataset
-    
-    def to_small_text(self) -> datasets.DatasetDict:
-        if self.__pool is None:
-            self.__pool = self.__dataset.dataset.select(self.indices.indices.tolist())
-        return self.__pool
+    # def dump(self, root_dir: pathlib.Path, filename: str | None = None):
+    #     config = self.get_config()
+    #     with open_subbuild(root_dir, storage.DATA_DIR, filename if filename is not None else self.get_config_filename()).open(
+    #         "w"
+    #     ) as df:
+    #         json.dump(config, df)
+    #     for labels in self.annotations.values():
+    #         labels.dump(root_dir, str(self.id))
 
-    @property
-    def pool(self) -> 'DatasetView':
-        return DatasetView(self)
-    
-    @property
-    def size(self) -> int:
-        return len(self.indices)
-    
-    @property
-    def annotations(self) ->  dict[LLMType, LLMLabels]:
-        if self.__annotations is not None:
-            return self.__annotations
-        if self.__dataset is not None:
-            all_annotations = self.__dataset.annotations
-            self.__annotations = {}
-            for llm, labels in all_annotations.items():
-                pool_labels = labels.labels[self.indices.indices]
-                self.__annotations[llm] = LLMLabels(llm=llm, labels=pool_labels)
-            return self.__annotations
-        raise ValueError("Cannot get annotations without base dataset")
-
-    def get_config(self, external_id: str) -> dict:
-        return {
-            'indices_file': os.path.join(DATA_DIR, self.indices.get_config_filename(external_id)),
-            'pool_files': {     
-                key: os.path.join(DATA_DIR, f"{external_id}_pool_{key}.dat") for key in self.pool.dataset
-                },
-            'dataset_id': str(self.__dataset.get_id()) if self.__dataset is not None else None,
-            'annotations': {
-                str(llm): os.path.join(DATA_DIR, labels.get_config_filename(external_id)) 
-                for llm, labels in self.annotations.items()
-            } if self.__annotations is not None else {},
-        }
-    
-    def get_config_filename(self, external_id : str) -> str:
-        return f"{external_id}_pool.json"
-    
-    def __str__(self) -> str:
-        return self.indices.repr
-
-    def dump(self, root_dir: os.PathLike, external_id: str, filename: str | None = None):
-        config = self.get_config(external_id)
-        with open(os.path.join(
-                root_dir, 
-                DATA_DIR, 
-                filename if filename is not None else self.get_config_filename(external_id)
-                ), 'w') as cfg:
-            json.dump(config, cfg)
-        self.indices.dump(root_dir, external_id)
-        for key, file in config['pool_files'].items():
-            self.pool.dataset[key].save_to_disk(os.path.join(root_dir, file))
-        for llm, file in config['annotations'].items():
-            self.annotations[LLMType.from_str(llm)].dump(root_dir, external_id)
-
-    @staticmethod
-    def load(root_dir: os.PathLike, filename: str, dataset: Dataset | None = None) -> 'Pool':
-        config_path = filename if os.path.isabs(filename) else os.path.join(root_dir, filename)
-        with open(config_path, 'r') as cfg:
-            config = json.load(cfg)
-        indices_file = config['indices_file']
-        if indices_file.startswith(f"{DATA_DIR}{os.sep}"):
-            indices_file = indices_file[len(DATA_DIR) + 1:]
-        indices = Indices.load(root_dir, indices_file)
-        pool_data = datasets.DatasetDict()
-        for key, file in config['pool_files'].items():
-            pool_data[key] = datasets.Dataset.load_from_disk(os.path.join(root_dir, file))
-        pool = Pool(indices=indices, dataset=dataset)
-        pool.__pool = pool_data
-        pool.__annotations = {
-            LLMType.from_str(llm_str): LLMLabels.load(
-                root_dir,
-                label_file[len(DATA_DIR) + 1:] if label_file.startswith(f"{DATA_DIR}{os.sep}") else label_file
-            )
-            for llm_str, label_file in config['annotations'].items()
-        }
-        return pool
-    
-    def __call__(self, root_dir: os.PathLike, external_id: str, filename: str | None = None) -> 'Pool':
-        self.__root_dir = root_dir
-        self.__external_id = external_id
-        self.__filename = filename
-        return self
-    
-    def __enter__(self) -> 'Pool':
-        return self
-    
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.__root_dir is None or self.__external_id is None:
-            print("Warning: cannot dump Pool on exit")
-        else:
-            self.dump(self.__root_dir, self.__external_id, self.__filename)
+    # @staticmethod
+    # def load(root_dir: pathlib.Path, filename: str) -> "CompleteDataset":
+    #     with (root_dir / filename).open("r") as df:
+    #         config = json.load(df)
+    #     dataset = CompleteDataset(
+    #         id=DatasetID.from_str(config["id"]),
+    #         text_field=config["text_field"],
+    #         label_field=config["label_field"],
+    #     )
+    #     dataset.__load_annotations(config)
+    #     return dataset
 
 
-class DatasetView:
-    def __init__(self, base: Dataset | Pool):
-        self.base = base
+class Datasets(storage.Storable):
+    def __init__(self, *datasets: CompleteDataset):
+        self.datasets = {dataset.id: dataset for dataset in datasets}
 
-    @property
-    def dataset(self) -> datasets.DatasetDict:
-        return self.base.to_small_text()
-    
-    @property
-    def annotations(self) ->  dict[LLMType, LLMLabels]:
-        return self.base.annotations
-    
-    @property
-    def train(self) -> datasets.Dataset:
-        return self.dataset["train"]
-    
-    @property
-    def validation(self) -> datasets.Dataset:
-        return self.dataset.get("validation", self.dataset["test"])
-    
-    @staticmethod
-    def to_transformers_dataset(subset: datasets.Dataset, tokenizer: BertTokenizerFast, num_classes: int, max_length: int = 128) -> TransformersDataset:
-        texts = subset["text"]
-        labels = np.array(subset["label"], dtype=np.int64)
-        target_labels = np.arange(num_classes, dtype=np.int64)
-
-        return TransformersDataset.from_arrays(
-            texts,
-            labels,
-            tokenizer,
-            target_labels=target_labels,
-            max_length=max_length,
-        )
-
-class  Datasets(JSONifiable):
-    def __init__(self, *datasets: Dataset, config_names: dict[DatasetID, str] | None = None):
-        self.datasets = {dataset.id: (dataset, dataset.get_config_filename()) for dataset in datasets}
-        for dataset_id, config_name in (config_names or {}).items():
-            if dataset_id not in self.datasets:
-                raise ValueError("Config name provided for unknown dataset ID")
-            self.datasets[dataset_id] = (self.datasets[dataset_id][0], config_name)
-
-    def __contains__(self, key: Dataset | DatasetID) -> bool:
-        if isinstance(key, Dataset):
+    def __contains__(self, key: CompleteDataset | DatasetID) -> bool:
+        if isinstance(key, CompleteDataset):
             key = key.id
         return key in self.datasets
-        
-    def to_json(self) -> dict:
-        return {
-            'datasets': {key: os.path.join(DATA_DIR, config_name) for key, (_, config_name) in self.datasets.items()}, 
-        }
-    
-    @staticmethod
-    def from_json(data: dict, root_dir: os.PathLike| None = None) -> 'Datasets': # TODO implement remote
-        if root_dir is None:
-            raise ValueError("root_dir must be provided to load Datasets from json")
-        return Datasets(*[
-            Dataset.load(root_dir, filename) 
-            for filename in data['datasets'].values()
-        ])
 
-    def add(self, dataset: Dataset) -> None:
+    def add(self, dataset: CompleteDataset) -> None:
         if dataset.id not in self.datasets:
-            self.datasets[dataset.id] = dataset 
+            self.datasets[dataset.id] = dataset
             return
-        raise ValueError("Dataset with the same ID already exists in the collection")
-    
-    def __get_item__(self, key: DatasetID) -> Dataset:
+        raise ValueError("Dataset with the same storage.ID already exists in the collection")
+
+    def __getitem__(self, key: DatasetID) -> CompleteDataset:
         if key in self.datasets:
             return self.datasets[key]
         raise KeyError("Dataset not found in the collection")
-    
-    def __iter__(self) -> Iterable[Dataset]:
+
+    def __iter__(self) -> Iterable[CompleteDataset]:
         return iter(self.datasets.values())
-    
-class DataDatabase(Dumpable):
-    EXPERIMENTS_FILE = "experiments.json"
-    DATASETS_FILE = "datasets.json"
+
+    @staticmethod
+    def _get_salt() -> storage.Hash:
+        return storage.Storable.hash_str("datasets")
+
+    def get_id(self) -> storage.ID:
+        return f"datasets#{self._get_salt()}"
+
+    def as_storable(self) -> storage.StorableBundle:
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): storage.StorableEntry(
+                    payload={
+                        "datasets": {str(dataset_id): str(dataset.id) for dataset_id, dataset in self.datasets.items()},
+                    },
+                    type=storage.StorableType.DATASETS,
+                ),
+                **dict(item for d in self.datasets.values() for item in d.as_storable().entries.items()),
+            },
+        )
+
+
+class DataDatabase:
     BACKUPS_COUNT = 5
-    
-    def __init__(self, root_dir: os.PathLike, local: bool = True): # TODO  implement remote
+
+    def __init__(self, root_dir: pathlib.Path, local: bool = True):  # TODO  implement remote
+        self.objects_store: dict[storage.ID, storage.CacheEntry] = {}
         self.root_dir = root_dir
-        self.datasets: Datasets = DataDatabase.__load_datasets(root_dir)
-        self.experiments: experiments.Experiments = DataDatabase.__load_experiments(root_dir)
         self.local = local
-        self.__enter = False
+        self.__connected = False
+        self.__datasets: Datasets = None
+        self.__experiments: experiments.Experiments = None
 
-    def __load_experiments(self, root_dir: os.PathLike) -> experiments.Experiments:
-        if self.local:
-            if os.path.exists(os.path.join(root_dir, DATA_DIR, self.EXPERIMENTS_FILE)):
-                with open(os.path.join(root_dir, DATA_DIR, self.EXPERIMENTS_FILE), 'r') as ef:
-                    experiments_json = json.load(ef)
-                return experiments.Experiments.from_json(experiments_json)
-            return experiments.Experiments()
-        assert False, "Remote databases are not implemented yet" # TODO remote dbs
+    @property
+    def datasets(self) -> Datasets:
+        if self.__datasets is None:
+            self.__datasets = Datasets()
+        return self.__datasets
 
-    def __load_datasets(self, root_dir: os.PathLike) -> Datasets:
-        if self.local:
-            if os.path.exists(os.path.join(root_dir, DATA_DIR, self.DATASETS_FILE)):
-                with open(os.path.join(root_dir, DATA_DIR, self.DATASETS_FILE), 'r') as df:
-                    datasets_json = json.load(df)
-                return Datasets.from_json(datasets_json, root_dir)
-            return Datasets()
-        assert False, "Remote databases are not implemented yet" # TODO remote dbs
+    @property
+    def experiments(self) -> "experiments.Experiments":
+        if self.__experiments is None:
+            self.__experiments = experiments.Experiments()
+        return self.__experiments
 
-    def register(self, experiment: experiments.Experiment) -> None: # TODO implement remote
-        if experiment not in self.experiments:
-            self.experiments.add(experiment) 
-    
-    def load(self, obj: experiments.Experiment): # TODO implement remote
-        if isinstance(obj, experiments.Experiment):
-            if obj in self:
-                key = experiments.Experiments.ExperimentKey.from_experiment(obj)
-                return self.experiments[key][0]
-            raise KeyError("Experiment not found in the database") 
-            
-    def __contains__(self, experiment: experiments.Experiment | DatasetID) -> bool:
+    def store_fast(self, obj: storage.StorableBundle, format: storage.Format, obj_id: storage.ID | None = None):
+        if obj_id is not None and obj_id in self.objects_store:
+            return
+
+        if obj_id is None:
+            obj_id = obj.main
+
+        cache_entry = storage.CacheEntry(obj=obj.entries[obj_id], meta=storage.CacheMetadata(stored=False, format=None))
+        self.objects_store[obj_id] = cache_entry
+        self.__store_entry(obj, cache_entry.obj, format)
+        self.objects_store[obj_id].meta.stored = True
+        self.objects_store[obj_id].meta.format = format
+        if obj.entries[obj_id].type == storage.StorableType.EXPERIMENT:
+            ...  # TODO: from_storable
+        if obj.entries[obj_id].type == storage.StorableType.EXPERIMENT_HISTORY:
+            ...  # TODO: create experiment and add
+
+    def __store_entry(self, bundle: storage.StorableBundle, entry: storage.StorableEntry, format: storage.Format):
+        filepath = self.root_dir / storage.DATA_DIR
+        match entry.type:
+            case storage.StorableType.ARRAY:
+                filepath = filepath / "bin"
+                if format != storage.Format.NPZ:
+                    raise ValueError("Only NPZ format is supported for arrays")
+            case t if t in (storage.StorableType.POOL, storage.StorableType.SEEDED_INDICES):
+                filepath = filepath / "markup"
+            case storage.StorableType.EXPERIMENT_HISTORY:
+                filepath = filepath / "experiments" / "hisories"
+            case storage.StorableType.DATASET:
+                filepath = filepath / "datasets"
+            case t if t in (storage.StorableType.DATASETS, storage.StorableType.EXPERIMENTS):
+                pass
+            case storage.StorableType.LLM_LABELS:
+                ...  # TODO: store labels
+            case storage.StorableType.EXPERIMENT:
+                filepath = filepath / "experiments"
+            case storage.StorableType.EXPERIMENT_HISTORY:
+                filepath = filepath / "experiments" / "histories"
+        filepath /= format.format_name(entry.id, entry.type)
+        match entry.type:
+            case storage.StorableType.DATASET:
+                ...  # TODO: implement move logic that is in 677 to 716
+            case t if t in (
+                storage.StorableType.POOL,
+                storage.StorableType.SEEDED_INDICES,
+                storage.StorableType.EXPERIMENT_HISTORY,
+                storage.StorableType.ARRAY,
+                storage.StorableType.EXPERIMENT,
+                storage.StorableType.EXPERIMENT_HISTORY,
+            ):
+                storage.Formatter.dump(entry, format, filepath)
+
+        match entry.type:
+            case storage.StorableType.POOL:
+                self.store_fast(bundle, format, entry.payload["indices"])
+            case t if t in (
+                storage.StorableType.SEEDED_INDICES,
+                storage.StorableType.EXPERIMENT_HISTORY,
+                storage.StorableType.DATASET,
+                storage.StorableType.ARRAY,
+            ):
+                pass
+            case storage.StorableType.DATASETS:
+                for dataset_id in bundle.entries[bundle.main].payload["datasets"]:
+                    self.store_fast(bundle, format, dataset_id)
+            case storage.StorableType.EXPERIMENTS:
+                for experiment_id in bundle.entries[bundle.main].payload["experiments"]:
+                    self.store_fast(bundle, format, experiment_id)
+            case storage.StorableType.EXPERIMENT:
+                for history_id in bundle.entries[bundle.main].payload["histories"].values():
+                    self.store_fast(bundle, format, history_id)
+            case storage.StorableType.LLM_LABELS:
+                ...  # TODO
+
+    def recollect_stored(self): ...  # TODO
+
+    def retrieve(self, experiment: "experiments.Experiment") -> "experiments.Experiment":
+        if experiment in self.experiments:
+            key = experiments.Experiments.ExperimentKey.from_experiment(experiment)
+            return self.experiments[key][0]
+        return experiment
+
+    def __contains__(self, experiment: "experiments.Experiment | DatasetID") -> bool:
         if isinstance(experiment, experiments.Experiment):
             return experiment in self.experiments
         elif isinstance(experiment, DatasetID):
             return experiment in self.datasets
-        
-    def get(self, obj: DatasetID):
+
+    def get(self, obj: DatasetID, text_field: str = "text", label_field: str = "label") -> CompleteDataset:
         if isinstance(obj, DatasetID):
             if obj in self.datasets:
                 return self.datasets.datasets[obj]
-            dataset = Dataset(
+            dataset = CompleteDataset(
                 id=obj,
-                text_field="text",
-                label_field="label",
+                text_field=text_field,
+                label_field=label_field,
             )
             self.datasets.add(dataset)
-            if self.__enter:
-                self.__exit_stack.enter_context(dataset(self.root_dir))
-            return dataset
-        
-    @staticmethod
-    def get_config_filename() -> str:
-        return "DONT_EVER_TOUCH_THIS_FILE_database8=D.json"
-    
-    def get_config(self) -> dict:
-        old_config = {}
-        if os.path.exists(os.path.join(self.root_dir, DATA_DIR, self.get_config_filename())):
-            with open(os.path.join(self.root_dir, DATA_DIR, self.get_config_filename()), 'r') as dbf:
-                old_config = json.load(dbf)
-        last_backup_id = old_config.get('backup_id', 1)
-        return {
-            'datasets_file': os.path.join(DATA_DIR, self.DATASETS_FILE),
-            'experiments_file': os.path.join(DATA_DIR, self.EXPERIMENTS_FILE),
-            'backup_id': last_backup_id + 1,
-            'backup_file': f"{self.get_config_filename()[:-5]}_{last_backup_id}.json",
-        }
-    
-    @staticmethod
-    def __is_experiments_subset(cfg1: dict, cfg2: dict) -> bool:
-        return cfg1['root_dir'] == cfg2['root_dir'] and set(cfg1['experiments']).issubset(set(cfg2['experiments']))
-
-    @staticmethod
-    def __is_datasets_subset(cfg1: dict, cfg2: dict, root_dir: os.PathLike, datasets: Datasets) -> bool:
-        if not set(cfg1['datasets']).issubset(set(cfg2['datasets'])):
-            return False
-        for key in cfg1['datasets']:
-            ds1 = Dataset.load(root_dir, cfg1['datasets'][key])
-            ds2 = datasets[DatasetID.from_str(key)]
-            annot1 = ds1.annotations
-            annot2 = ds2.annotations
-            if set(annot1) != set(annot2):
-                return False
-            
-            if not all(annot1[llm] == annot2[llm] for llm in annot1):
-                return False
-        return True
-            
-
-    def dump(self, root_dir: os.PathLike, filename: str | None = None):
-        config = self.get_config()
-        if os.path.exists(os.path.join(self.root_dir, DATA_DIR, self.get_config_filename())):
-            os.rename(
-                os.path.join(self.root_dir, DATA_DIR, self.get_config_filename()),
-                os.path.join(self.root_dir, DATA_DIR, config['backup_file'])
+            self.objects_store.update(
+                {
+                    id: storage.CacheEntry(
+                        obj=entry, meta=storage.CacheMetadata(stored=False, format=storage.Format.JSON)
+                    )
+                    for id, entry in dataset.as_storable().entries.items()
+                }
             )
-        if os.path.exists(os.path.join(self.root_dir, DATA_DIR, f"{self.get_config_filename()[:-5]}_{(config['backup_id'] - self.BACKUPS_COUNT)}.json")):
-            os.remove(os.path.join(self.root_dir, DATA_DIR, f"{self.get_config_filename()[:-5]}_{(config['backup_id'] - self.BACKUPS_COUNT)}.json"))
-        
-        with open(os.path.join(
-                root_dir, 
-                DATA_DIR, 
-                filename if filename is not None else self.get_config_filename()
-                ), 'w') as dbf:
+
+            return dataset
+
+    @staticmethod
+    def get_config_name() -> str:
+        return "DONT_EVER_TOUCH_THIS_FILE_database8=D"
+
+    def generate_storables(self, backup_id) -> dict:
+        return {
+            "backup_id": backup_id,
+            "backup_file": f"{self.get_config_name()}_{backup_id}.json",
+            "objects": {
+                id: {
+                    "type": entry.obj.type.value,
+                    "payload": entry.obj.payload,
+                }
+                for id, entry in self.objects_store.items()
+                if not entry.meta.stored
+            },
+            "experiments": [
+                id
+                for id, entry in self.objects_store.items()
+                if entry.obj.type == storage.StorableType.EXPERIMENT
+            ],
+            "databases": {
+                id: entry.obj.payload['dataset']
+                for id, entry in self.objects_store.items()
+                if entry.obj.type == storage.StorableType.DATASET
+            }
+        }
+
+    def connect(self) -> "DataDatabase":
+        if self.__connected:
+            raise RuntimeError("Database is already connected, cannot connect again")
+        self.__connected = True
+        if not self.local:  # TODO: implement remote
+            raise NotImplementedError("Remote databases are not implemented yet")
+        if (self.root_dir / storage.DATA_DIR / f"{DataDatabase.get_config_name()}.json").exists():
+            self.load()
+        return self
+
+    def __enter__(self):
+        return self.connect()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for id, entry in self.objects_store.items():
+            if not entry.meta.stored:
+                self.__store_entry(
+                    storage.StorableBundle(main=id, entries={id: entry.obj}),
+                    entry.obj,
+                    storage.Format.JSON if entry.obj.type != storage.StorableType.ARRAY else storage.Format.NPZ,
+                )
+        # TODO: save datasets and experiments
+        self.dump()
+        self.__connected = False
+
+    def dump(self): # TODO: remove old files
+        path = self.root_dir / storage.DATA_DIR / f"{self.get_config_name()}.json"
+        if not self.local:
+            ...  # TODO: implement remote
+        old_config = {}
+        if path.exists():
+            with path.open("r") as dbf:
+                old_config = json.load(dbf)
+            old_path = path.rename(
+                self.root_dir / storage.DATA_DIR / f"{self.get_config_name()}_{old_config['backup_id'] + 1}.json"
+            )
+        last_backup_id = old_config.get("backup_id", 1)
+        config = self.generate_storables(last_backup_id + 1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as dbf:
             json.dump(config, dbf)
 
-        with open(os.path.join(root_dir, DATA_DIR, self.EXPERIMENTS_FILE), 'r') as ef:
-            old_experiments = json.load(ef)
-        
-        experiments = self.experiments.to_json()
-        if not DataDatabase.__is_experiments_subset(old_experiments, experiments):
-            new_filename = f"{self.get_config_filename()[:-5]}_{uuid.uuid4()}.json"
-            print(f'WARNING: Some experiments are missing, saved previous file in {new_filename}')
-            os.rename(
-                os.path.join(self.root_dir, DATA_DIR, self.EXPERIMENTS_FILE),
-                os.path.join(self.root_dir, DATA_DIR, new_filename)
-            )
+    def load(self):
+        if not self.local:  # TODO: implement remote
+            raise NotImplementedError("Remote databases are not implemented yet")
+        db = DataDatabase(self.root_dir, self.local)
+        config_path = self.root_dir / storage.DATA_DIR / f"{db.get_config_name()}.json"
+        with config_path.open("r") as dbf:
+            config = json.load(dbf)
+        for id, entry in config["objects"].items():
+            ...  # TODO: implement from_storable
 
-        with open(os.path.join(root_dir, DATA_DIR, self.EXPERIMENTS_FILE), 'w') as ef:
-            json.dump(self.experiments.to_json(), ef)
-         #TODO implement proper incremental experiment dumping
-        # if not self.__enter:
-        #     for experiment in self.experiments:
-        #         experiment.dump(root_dir)
+    # @staticmethod
+    # def __is_experiments_subset(cfg1: dict, cfg2: dict) -> bool:
+    #     return cfg1["root_dir"] == cfg2["root_dir"] and set(cfg1["experiments"]).issubset(set(cfg2["experiments"]))
 
-        with open(os.path.join(root_dir, DATA_DIR, self.DATASETS_FILE), 'r') as df:
-            old_datasets = json.load(df)
-        
-        datasets_config = old_datasets
+    # @staticmethod
+    # def __is_datasets_subset(cfg1: dict, cfg2: dict, root_dir: pathlib.Path, datasets: Datasets) -> bool:
+    #     if not set(cfg1["datasets"]).issubset(set(cfg2["datasets"])):
+    #         return False
+    #     for key in cfg1["datasets"]:
+    #         ds1 = CompleteDataset.load(root_dir, cfg1["datasets"][key])
+    #         ds2 = datasets[DatasetID.from_str(key)]
+    #         annot1 = ds1.annotations
+    #         annot2 = ds2.annotations
+    #         if set(annot1) != set(annot2):
+    #             return False
 
-        if not DataDatabase.__is_datasets_subset(old_datasets, self.datasets.to_json(), root_dir, self.datasets):
-            salt = f'{uuid.uuid4()}'
-            new_filename = f"{self.get_config_filename()[:-5]}_{salt}.json"
-            print(f'WARNING: Some datasets are missing or have different annotations, saved previous file in {new_filename}')
-            os.rename(
-                os.path.join(self.root_dir, DATA_DIR, self.DATASETS_FILE),
-                os.path.join(self.root_dir, DATA_DIR, new_filename)
-            )
-            for dataset_id in old_datasets['datasets']:
-                renamed = False
-                ds1 = Dataset.load(root_dir, old_datasets['datasets'][dataset_id])
-                ds2 = self.datasets[DatasetID.from_str(dataset_id)]
-                annot1 = ds1.annotations
-                annot2 = ds2.annotations
-                cfg1 = ds1.get_config()                
-                for llm in annot1:
-                    if not (annot1[llm] == annot2[llm]):
-                        print(f'WARNING: Annotations for dataset {dataset_id} and LLM {llm} differ between old and new database')
-                        filename = cfg1['annotations'][str(llm)]
-                        new_annotations_filename = f"{filename[:-5]}_{salt}.json"
-                        os.rename(
-                            os.path.join(self.root_dir, DATA_DIR, filename),
-                            os.path.join(self.root_dir, DATA_DIR, new_annotations_filename)
-                        )
-                        if not renamed:
-                            new_dataset_filename = f"{old_datasets['datasets'][dataset_id][:-5]}_{salt}.json"
-                            os.rename(
-                                os.path.join(self.root_dir, DATA_DIR, old_datasets['datasets'][dataset_id]),
-                                os.path.join(self.root_dir, DATA_DIR, new_dataset_filename)
-                            )
-                            renamed = True
-                        cfg1['annotations'][str(llm)] = new_annotations_filename
-                if renamed:
-                    with open(os.path.join(self.root_dir, DATA_DIR, new_dataset_filename), 'w') as df:
-                        json.dump(cfg1, df)
-                    datasets_config['datasets'][dataset_id] = ds1.get_config_filename()
-            
-        with open(os.path.join(root_dir, DATA_DIR, self.DATASETS_FILE), 'w') as df:
-            json.dump(datasets_config, df)
-        if self.__enter:
-            return
-        for dataset in self.datasets:
-            dataset.dump(root_dir, datasets_config['datasets'][str(dataset.id)])
-        
-    @staticmethod
-    def load(root_dir: os.PathLike, filename: str) -> 'DataDatabase':
-        raise RuntimeError("Use DataDatabase(root_dir) instead of load")
-    
-    def __enter__(self) -> 'DataDatabase':
-        self.__enter = True
-        self.__exit_stack = contextlib.ExitStack()
-        for dataset in self.datasets:
-            self.__exit_stack.enter_context(dataset(self.root_dir))
-        # for experiment in self.experiments:
-        #     self.__exit_stack.enter_context(experiment(self.root_dir))
-        return self
-    
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.__enter = False
-        self.__exit_stack.close()
-        self.dump(self.root_dir)
+    #         if not all(annot1[llm] == annot2[llm] for llm in annot1):
+    #             return False
+    #     return True
 
+    # def dump(self, root_dir: pathlib.Path, filename: str | None = None):
+    #     config = self.get_config()
+    #     if (self.root_dir / storage.DATA_DIR / self.get_config_filename()).exists():
+    #         (self.root_dir / storage.DATA_DIR / self.get_config_filename()).rename(
+    #             self.root_dir / storage.DATA_DIR / config["backup_file"]
+    #         )
+    #     if (
+    #         self.root_dir
+    #         / storage.DATA_DIR
+    #         / f"{self.get_config_filename()[:-5]}_{(config['backup_id'] - self.BACKUPS_COUNT)}.json"
+    #     ).exists():
+    #         (
+    #             self.root_dir
+    #             / storage.DATA_DIR
+    #             / f"{self.get_config_filename()[:-5]}_{(config['backup_id'] - self.BACKUPS_COUNT)}.json"
+    #         ).unlink()
+
+    #     with open_subbuild(
+    #         root_dir / storage.DATA_DIR / (filename if filename is not None else self.get_config_filename())
+    #     ).open("w") as dbf:
+    #         json.dump(config, dbf)
+
+    #     old_exp_path = root_dir / storage.DATA_DIR / self.EXPERIMENTS_FILE
+    #     if old_exp_path.exists():
+    #         with old_exp_path.open("r") as ef:
+    #             old_experiments = json.load(ef)
+
+    #     experiments = self.experiments.to_json()
+    #     if old_exp_path.exists() and not DataDatabase.__is_experiments_subset(old_experiments, experiments):
+    #         new_filename = f"{self.get_config_filename()[:-5]}_{uuid.uuid4()}.json"
+    #         print(f"WARNING: Some experiments are missing, saved previous file in {new_filename}")
+    #         (self.root_dir / storage.DATA_DIR / self.EXPERIMENTS_FILE).rename(self.root_dir / storage.DATA_DIR / new_filename)
+
+    #     with open_subbuild(root_dir / storage.DATA_DIR / self.EXPERIMENTS_FILE).open("w") as ef:
+    #         json.dump(self.experiments.to_json(), ef)
+
+    #     old_datasets_path = root_dir / storage.DATA_DIR / self.DATASETS_FILE
+    #     if old_datasets_path.exists():
+    #         with old_datasets_path.open("r") as df:
+    #             old_datasets = json.load(df)
+
+    #     datasets_config = old_datasets if old_datasets_path.exists() else self.datasets.to_json()
+
+    #     if old_datasets_path.exists() and not DataDatabase.__is_datasets_subset(
+    #         old_datasets, self.datasets.to_json(), root_dir, self.datasets
+    #     ):
+    #         salt = f"{uuid.uuid4()}"
+    #         new_filename = f"{self.get_config_filename()[:-5]}_{salt}.json"
+    #         print(
+    #             f"WARNING: Some datasets are missing or have different annotations, saved previous file in {new_filename}"
+    #         )
+    #         (self.root_dir / storage.DATA_DIR / self.DATASETS_FILE).rename(self.root_dir / storage.DATA_DIR / new_filename)
+    #         for dataset_id in old_datasets["datasets"]:
+    #             renamed = False
+    #             ds1 = CompleteDataset.load(root_dir, old_datasets["datasets"][dataset_id])
+    #             ds2 = self.datasets[DatasetID.from_str(dataset_id)]
+    #             annot1 = ds1.annotations
+    #             annot2 = ds2.annotations
+    #             cfg1 = ds1.get_config()
+    #             for llm in annot1:
+    #                 if not (annot1[llm] == annot2[llm]):
+    #                     print(
+    #                         f"WARNING: Annotations for dataset {dataset_id} and LLM {llm} differ between old and new database"
+    #                     )
+    #                     filename = cfg1["annotations"][str(llm)]
+    #                     new_annotations_filename = f"{filename[:-5]}_{salt}.json"
+    #                     (self.root_dir / storage.DATA_DIR / filename).rename(
+    #                         self.root_dir / storage.DATA_DIR / new_annotations_filename
+    #                     )
+    #                     if not renamed:
+    #                         new_dataset_filename = f"{old_datasets['datasets'][dataset_id][:-5]}_{salt}.json"
+    #                         (self.root_dir / storage.DATA_DIR / old_datasets["datasets"][dataset_id]).rename(
+    #                             self.root_dir / storage.DATA_DIR / new_dataset_filename
+    #                         )
+
+    #                         renamed = True
+    #                     cfg1["annotations"][str(llm)] = new_annotations_filename
+    #             if renamed:
+    #                 with open_subbuild(self.root_dir / storage.DATA_DIR / new_dataset_filename).open("w") as df:
+    #                     json.dump(cfg1, df)
+    #                 datasets_config["datasets"][dataset_id] = ds1.get_config_filename()
+
+    #     with open_subbuild(root_dir / storage.DATA_DIR / self.DATASETS_FILE).open("w") as df:
+    #         json.dump(datasets_config, df)
+    #     if self.__enter:
+    #         return
+    #     for dataset in self.datasets:
+    #         dataset.dump(root_dir, datasets_config["datasets"][str(dataset.id)])
+
+    # @staticmethod
+    # def load(root_dir: pathlib.Path, filename: str) -> "DataDatabase":
+    #     raise RuntimeError("Use DataDatabase(root_dir) instead of load")
+
+    # def __enter__(self) -> "DataDatabase":
+    #     self.__enter = True
+    #     self.__exit_stack = contextlib.ExitStack()
+    #     for dataset in self.datasets:
+
+    #         self.__exit_stack.enter_context(dataset(self.root_dir))
+    #     return self
+
+    # def __exit__(self, exc_type, exc_value, traceback):
+    #     self.__enter = False
+    #     self.__exit_stack.close()
+    #     self.dump(self.root_dir)
