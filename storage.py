@@ -225,6 +225,27 @@ class Format(enum.Enum):
             case _:
                 assert False, "unreachable"
 
+    @staticmethod
+    def type_from_format_name(filename: str) -> StorableType:
+        if filename.endswith("_pool.json"):
+            return StorableType.POOL
+        elif filename.endswith("_seeded_indices.json"):
+            return StorableType.SEEDED_INDICES
+        elif filename.endswith("_dataset.json"):
+            return StorableType.DATASET
+        elif filename.endswith("_datasets.json"):
+            return StorableType.DATASETS
+        elif filename.endswith("_experiment.json"):
+            return StorableType.EXPERIMENT
+        elif filename.endswith("_experiments.json"):
+            return StorableType.EXPERIMENTS
+        elif filename.endswith("_hist.json"):
+            return StorableType.EXPERIMENT_HISTORY
+        elif filename.endswith(".npz"):
+            return StorableType.ARRAY
+        else:
+            raise ValueError(f"Unknown format for file: {filename}")
+
     def switch_format(self, new_entry_type: StorableType) -> "Format":
         match self:
             case Format.JSON:

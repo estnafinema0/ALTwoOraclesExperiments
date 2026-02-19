@@ -322,7 +322,7 @@ class Experiment(Storable):
         repeat: int = 1,
         from_run: int = 1,
     ):
-        for run in range(from_run, from_run + repeat):
+        for run in range(from_run, repeat + 1):
             self.run_single(tokenizer, fine_tuning_model, run, database)
 
 

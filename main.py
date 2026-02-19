@@ -2,11 +2,15 @@ from database import *
 from experiments import *
 from strategies import *
 
+import warnings
+from small_text.utils.annotations import ExperimentalWarning
 from transformers import AutoTokenizer
 
 
 def main() -> int | None:
+    warnings.filterwarnings("ignore", category=ExperimentalWarning)
     with DataDatabase(".") as db:
+        db.recollect_stored()
         ag_news = db.get_dataset(DatasetID("ag_news"))
         sst_2 = db.get_dataset(DatasetID("glue", "sst2"), text_field="sentence")
         experiments = Experiments.from_experiments(
@@ -34,6 +38,7 @@ def main() -> int | None:
             5,
             db,
         )
+        db.recollect_stored()
 
 
 if __name__ == "__main__":

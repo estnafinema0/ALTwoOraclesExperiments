@@ -511,8 +511,8 @@ class DataDatabase:
             self.__experiments = experiments.Experiments()
         return self.__experiments
 
-    def retrieve(self, id: storage.ID) -> storage.Storable:
-        if id in self.objects_store:
+    def retrieve(self, id: storage.ID, force_load: bool = False) -> storage.Storable:
+        if id in self.objects_store and not force_load:
             return self.objects_store[id]
         if id in self.stored_index:
             obj = storage.Storable.restore(self.stored_index[id].obj, self, self.stored_index[id].obj.type)
@@ -581,12 +581,14 @@ class DataDatabase:
             self.stored_index[obj_id].format = format
 
     def __store_entry(self, obj: "storage.StorableEntry", format: storage.Format):
-        where = self.root_dir / storage.DATA_DIR / self.__get_directory(obj.type) / format.format_name(obj.id, obj.type)
+        where = (
+            self.root_dir / storage.DATA_DIR / self.__get_rel_directory(obj.type) / format.format_name(obj.id, obj.type)
+        )
         self.__pre_store_entry(obj, where)
         storage.Formatter.dump(obj, format, where)
         self.__post_store_entry(obj, where)
 
-    def __get_directory(self, entry_type: storage.StorableType) -> pathlib.Path:
+    def __get_rel_directory(self, entry_type: storage.StorableType) -> pathlib.Path:
         match entry_type:
             case storage.StorableType.ARRAY:
                 return pathlib.Path("bin")
@@ -645,12 +647,64 @@ class DataDatabase:
     def __post_dump(self, backup_id: int):
         if not self.local:
             assert False, "TODO: implement remote"
-        # breakpoint()
         killable_old = self.root_dir / storage.DATA_DIR / f"{self.get_config_name()}_{backup_id - 4}.json"
         if killable_old.exists():
             killable_old.unlink()
 
-    def recollect_stored(self): ...  # TODO
+    def recollect_stored(self):
+        files: list[pathlib.Path] = []
+        tmp_dict = dict(self.stored_index)
+        for id, entry in tmp_dict.items():
+            if entry.stored and entry.format is not None and entry.obj.type.is_groupable():
+                files.append(self.__get_rel_directory(entry.obj.type) / entry.format.format_name(id, entry.obj.type))
+                self.__load_from_disk(
+                    {
+                        "refs": {
+                            id: {
+                                "path": str(
+                                    self.__get_rel_directory(entry.obj.type)
+                                    / entry.format.format_name(id, entry.obj.type)
+                                ),
+                                "format": entry.format.value,
+                            }
+                        }
+                    },
+                    id,
+                )
+                obj = self.retrieve(id, force_load=True)
+                if obj.get_id() in self.objects_store:
+                    del self.objects_store[obj.get_id()]
+                if obj.get_id() in self.stored_index:
+                    del self.stored_index[obj.get_id()]
+                self.encache(obj)
+
+        self.dump()
+
+        for file in files:
+            path = self.root_dir / storage.DATA_DIR / file
+            path.unlink()
+
+        data_dir = self.root_dir / storage.DATA_DIR
+        for dir in (
+            data_dir,
+            data_dir / "experiments",
+            data_dir / "experiments" / "histories",
+            data_dir / "datasets",
+            data_dir / "markup",
+            data_dir / "bin",
+        ):
+            if not dir.exists():
+                continue
+            for file in dir.iterdir():
+                if file.is_file() and not file.name.startswith(self.get_config_name()):
+                    stored_type = storage.Format.type_from_format_name(file.name)
+                    if not stored_type.is_groupable():
+                        continue
+                    stored_id = file.name.rsplit("_", 1)[0]
+                    if stored_id in self.stored_index:
+                        file.unlink()
+                    else:
+                        print(f"[WARNING]: unindexed file: {file}")
 
     def get_dataset(self, obj: DatasetID, text_field: str = "text", label_field: str = "label") -> CompleteDataset:
         if obj in self.datasets:
@@ -688,7 +742,9 @@ class DataDatabase:
             },
             "refs": {
                 id: {
-                    "path": str(self.__get_directory(entry.obj.type) / entry.format.format_name(id, entry.obj.type)),
+                    "path": str(
+                        self.__get_rel_directory(entry.obj.type) / entry.format.format_name(id, entry.obj.type)
+                    ),
                     "format": entry.format.value,
                     # TODO: consider remote
                 }
