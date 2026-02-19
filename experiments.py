@@ -23,13 +23,14 @@ import functools
 from typing import Self, Optional, Never
 
 
+@Storable.make_storable(StorableType.EXPERIMENT_HISTORY)
 @dataclasses.dataclass(slots=True, frozen=True)
 class ExperimentHistory(Storable):
     final_accuracy: float
     final_macro_f1: float
     after_cold_start_accuracy: float
     after_cold_start_macro_f1: float
-    dataset_id: 'database.DatasetID'
+    dataset_id: "database.DatasetID"
     pool_size: int
     seed: int
     cs_strategy: strategies.ColdStartStrategy
@@ -49,7 +50,7 @@ class ExperimentHistory(Storable):
 
     @staticmethod
     def _get_salt(
-        dataset_id: 'database.DatasetID',
+        dataset_id: "database.DatasetID",
         seed: int,
         cs_strategy: strategies.QueryStrategyType,
         al_strategy: strategies.QueryStrategyType,
@@ -63,6 +64,15 @@ class ExperimentHistory(Storable):
 
     def get_id(self) -> ID:
         return f"{self.uuid}#{self._get_salt(self.dataset_id, self.seed, self.cs_strategy, self.al_strategy)}"
+
+    @staticmethod
+    def make_id(
+        dataset_id: "database.DatasetID",
+        seed: int,
+        cs_strategy: strategies.QueryStrategyType,
+        al_strategy: strategies.QueryStrategyType,
+    ) -> ID:
+        raise ValueError("ExperimentHistory IDs should be generated automatically, make_id should not be used directly")
 
     def as_storable(self) -> StorableBundle:
         return StorableBundle(
@@ -90,22 +100,30 @@ class ExperimentHistory(Storable):
             },
         )
 
-    # @staticmethod
-    # def from_json(json_dict: dict[str, any]) -> "ExperimentHistory":
-    #     return ExperimentHistory(
-    #         final_accuracy=json_dict["final_accuracy"],
-    #         final_macro_f1=json_dict["final_macro_f1"],
-    #         after_cold_start_accuracy=json_dict["after_cold_start_accuracy"],
-    #         after_cold_start_macro_f1=json_dict["after_cold_start_macro_f1"],
-    #         dataset_id=database.DatasetID.from_str(json_dict["dataset_id"]),
-    #         pool_size=json_dict["pool_size"],
-    #         seed=json_dict["seed"],
-    #         cs_strategy=strategies.ColdStartStrategy.from_str(json_dict["cs_strategy"]),
-    #         al_strategy=strategies.ActiveLearningStrategy.from_str(json_dict["al_strategy"]),
-    #         format_version=json_dict.get("format_version", 1),
-    #         duration_cs=datetime.timedelta(milliseconds=json_dict["duration_cs"]),
-    #         duration_total=datetime.timedelta(milliseconds=json_dict["duration_total"]),
-    #     )
+    @staticmethod
+    def from_storable(
+        entry: StorableEntry, data: "database.DataDatabase", storable_type: "StorableType | None" = None
+    ) -> Self:
+        if entry.id in data and storable_type != StorableType.EXPERIMENT_HISTORY:
+            return data.retrieve(entry.id)
+        payload = entry.payload
+        obj = ExperimentHistory(
+            final_accuracy=payload["final_accuracy"],
+            final_macro_f1=payload["final_macro_f1"],
+            after_cold_start_accuracy=payload["after_cold_start_accuracy"],
+            after_cold_start_macro_f1=payload["after_cold_start_macro_f1"],
+            dataset_id=database.DatasetID.from_str(payload["dataset_id"]),
+            pool_size=payload["pool_size"],
+            seed=payload["seed"],
+            cs_strategy=strategies.ColdStartStrategy.from_str(payload["cs_strategy"]),
+            al_strategy=strategies.ActiveLearningStrategy.from_str(payload["al_strategy"]),
+            format_version=payload["format_version"],
+            uuid=payload["uuid"],
+            duration_cs=datetime.timedelta(milliseconds=payload["duration_cs"]),
+            duration_total=datetime.timedelta(milliseconds=payload["duration_total"]),
+        )
+        data.encache(obj)
+        return obj
 
 
 def make_classifier_factory(
@@ -114,7 +132,7 @@ def make_classifier_factory(
     model_args = TransformerModelArguments(transformer_model_name)
 
     import torch
-    
+
     clf_factory = TransformerBasedClassificationFactory(
         model_args,
         num_classes,
@@ -127,25 +145,20 @@ def make_classifier_factory(
     return clf_factory
 
 
-class Experiment(Storable):  # TODO: multiple runs
+@Storable.make_storable(StorableType.EXPERIMENT)
+class Experiment(Storable):
     def __init__(  # TODO: add tags
         self,
         dataset: "database.CompleteDataset",
         pool: "database.Pool",
         cold_start_strategy: strategies.ColdStartStrategy,
         active_learning_strategy: strategies.ActiveLearningStrategy,
-        # name: str | None = None,
     ):
         self.dataset = dataset
         self.pool = pool
         self.cold_start_strategy = cold_start_strategy
         self.active_learning_strategy = active_learning_strategy
-        # self.name = (
-        #     name
-        #     if name is not None
-        #     else f"{dataset.get_id()}_cs={cold_start_strategy}_al={active_learning_strategy}_{pool}"
-        # )
-        self.histories:  dict[int, ExperimentHistory] = {}
+        self.histories: dict[int, ExperimentHistory] = {}
 
     @property
     def budget(self) -> int:
@@ -160,20 +173,39 @@ class Experiment(Storable):  # TODO: multiple runs
         return len(self.histories)
 
     @staticmethod
-    def _get_salt(dataset, pool, cold_start_strategy, active_learning_strategy, runs) -> Hash:
+    def _get_salt(
+        dataset_id: "database.DatasetID",
+        pool_id: ID,
+        cold_start_strategy: strategies.ColdStartStrategy,
+        active_learning_strategy: strategies.ActiveLearningStrategy,
+    ) -> Hash:
         return Storable.combine_hashes(
             *map(
                 Storable.hash_str,
                 itertools.chain(
-                    dataset.get_id(),
-                    pool.get_id(),
-                    map(str, (cold_start_strategy, active_learning_strategy, runs)),
+                    dataset_id,
+                    pool_id,
+                    map(str, (cold_start_strategy, active_learning_strategy)),
                 ),
             )
         )
 
     def get_id(self) -> ID:
-        return f"{self.dataset.get_id()}__{self.pool.get_id()}__{self.cold_start_strategy}__{self.active_learning_strategy}__{self.runs}#{self._get_salt(self.dataset, self.pool, self.cold_start_strategy, self.active_learning_strategy, self.runs)}"
+        return self.make_id(
+            self.dataset.get_id(),
+            self.pool.get_id(),
+            self.cold_start_strategy,
+            self.active_learning_strategy,
+        )
+
+    @staticmethod
+    def make_id(
+        dataset_id: "database.DatasetID",
+        pool_id: ID,
+        cold_start_strategy: strategies.ColdStartStrategy,
+        active_learning_strategy: strategies.ActiveLearningStrategy,
+    ) -> ID:
+        return f"{dataset_id}__{pool_id}__{cold_start_strategy}__{active_learning_strategy}#{Experiment._get_salt(dataset_id, pool_id, cold_start_strategy, active_learning_strategy)}"
 
     def as_storable(self) -> StorableBundle:
         return StorableBundle(
@@ -197,62 +229,32 @@ class Experiment(Storable):  # TODO: multiple runs
             },
         )
 
-    # def dump(self, root_dir: None = None, filename: str | None = None):
-    #     if self.__history is None:
-    #         raise ValueError("Experiment was not run yet, cannot dump")
-    #     if root_dir is not None:
-    #         raise ValueError("Root dir cannot be changed when dumping Experiment")
-
-    #     config = self.get_config()
-
-    #     with (
-    #         open_subbuild(
-    #             self.root_dir, database.DATA_DIR, filename if filename is not None else self.get_config_filename()
-    #         ).open("w") as ef,
-    #         open_subbuild(self.root_dir, config["history"]).open("w") as hf,
-    #     ):
-    #         json.dump(config, ef)
-    #         json.dump(self.history.to_json(), hf)
-
-    #     self.dataset.dump(self.root_dir)
-    #     self.pool.dump(self.root_dir, f"{self.dataset.get_id()}_{self.pool.indices.repr['seed']}_{self.pool.size}")
-
-    # @staticmethod
-    # def load(root_dir: pathlib.Path, filename: str) -> "Experiment":
-
-    #     with pathlib.Path(root_dir, database.DATA_DIR, filename).open("r") as ef:
-    #         config = json.load(ef)
-    #     dataset = database.CompleteDataset.from_json(config["dataset"])
-    #     pool = database.Pool.load(root_dir, config["pool"], dataset)
-    #     cold_start_strategy = strategies.ColdStartStrategy.from_str(config["cold_start_strategy"])
-    #     active_learning_strategy = strategies.ActiveLearningStrategy.from_str(config["active_learning_strategy"])
-    #     experiment = Experiment(
-    #         dataset=dataset,
-    #         pool=pool,
-    #         cold_start_strategy=cold_start_strategy,
-    #         active_learning_strategy=active_learning_strategy,
-    #         root_dir=root_dir,
-    #         name=config["name"],
-    #     )
-    #     with pathlib.Path(root_dir, config["history"]).open("r") as hf:  # TODO : подумать над другим форматом
-    #         history_json = json.load(hf)
-    #     experiment.__history = ExperimentHistory.from_json(history_json)
-    #     return experiment
-
-    # def __exit__(self, exc_type, exc_value, traceback):
-    #     if self.__history is None:
-    #         print("Warning: Experiment was not run, no history to save.")
-    #     else:
-    #         self.dump()
-    #         if self.__database is not None:
-    #             self.__database.register(self)
+    @staticmethod
+    def from_storable(
+        entry: StorableEntry, data: "database.DataDatabase", storable_type: "StorableType | None" = None
+    ) -> Self:
+        if entry.id in data and storable_type != StorableType.EXPERIMENT:
+            return data.retrieve(entry.id)
+        payload = entry.payload
+        obj = Experiment(
+            dataset=data.retrieve(payload["dataset"]),
+            pool=data.retrieve(payload["pool"]),
+            cold_start_strategy=strategies.ColdStartStrategy.from_str(payload["cold_start_strategy"]),
+            active_learning_strategy=strategies.ActiveLearningStrategy.from_str(payload["active_learning_strategy"]),
+        )
+        obj.histories = {int(run): data.retrieve(history_id) for run, history_id in payload["histories"].items()}
+        data.encache(obj)
+        return obj
 
     def __repr__(self) -> str:  # TODO: print tags
         return f"Experiment(cs={self.cold_start_strategy.__repr__()}, al={self.active_learning_strategy.__repr__()}, seed={self.pool.indices.seed}, runs={self.runs}, dataset={self.dataset.id})"
 
-    def run_single(self, tokenizer: "BertTokenizerFast", fine_tuning_model: str, run_number: int, database: "database.DataDatabase"):
+    def run_single(
+        self, tokenizer: "BertTokenizerFast", fine_tuning_model: str, run_number: int, database: "database.DataDatabase"
+    ):
         from small_text import PoolBasedActiveLearner
-        print(f"=== RUNNING EXPERIMENT (run {run_number}): {self} ===")
+
+        print(f"[INFO]: RUNNING EXPERIMENT (run {run_number}): {self}")
         num_classes = len(np.unique(self.dataset.train.y))
         train_dataset = self.pool.to_transformers_dataset(tokenizer, num_classes)
         test_dataset = self.dataset.validation.to_transformers_dataset(tokenizer, num_classes)
@@ -283,6 +285,7 @@ class Experiment(Storable):  # TODO: multiple runs
             n_iterations=self.cold_start_strategy.n_iterations,
             batch_size=self.cold_start_strategy.batch_size,
         )
+
         # active learning cycle
         print("Running active learning strategy...")
         acc_al, macro_f1_al, duration_al, indices_labeled = self.active_learning_strategy.query_strategy.run_loop(
@@ -307,14 +310,23 @@ class Experiment(Storable):  # TODO: multiple runs
             duration_cs=duration_cs,
             duration_total=duration_cs + duration_al,
         )
-        
+
         database.store_fast(self.histories[run_number].as_storable(), Format.JSON)
 
-    def run(self, tokenizer: "BertTokenizerFast", fine_tuning_model: str, database: "database.DataDatabase", *, repeat: int = 1, from_run: int = 1):
+    def run(
+        self,
+        tokenizer: "BertTokenizerFast",
+        fine_tuning_model: str,
+        database: "database.DataDatabase",
+        *,
+        repeat: int = 1,
+        from_run: int = 1,
+    ):
         for run in range(from_run, from_run + repeat):
             self.run_single(tokenizer, fine_tuning_model, run, database)
 
 
+@Storable.make_storable(StorableType.EXPERIMENTS)
 class Experiments(Storable):
     @dataclasses.dataclass(frozen=True, eq=True)
     class ExperimentKey:
@@ -330,7 +342,7 @@ class Experiments(Storable):
         def from_experiment(experiment: Experiment) -> "Experiments.ExperimentKey":
             return Experiments.ExperimentKey(
                 dataset_id=experiment.dataset.id,
-                pool_size=experiment.pool.size,
+                pool_size=len(experiment.pool),
                 seed=getattr(experiment.pool.indices, "seed", -1),
                 split=experiment.split,
                 budget=experiment.budget,
@@ -395,10 +407,14 @@ class Experiments(Storable):
         return Storable.hash_str("experminets")
 
     def get_id(self) -> ID:
-        raise ValueError('Experminets should not be stored out of database managment system')
+        raise ValueError("Experminets should not be stored out of database managment system")
+
+    @staticmethod
+    def make_id() -> ID:
+        return f"experiments#{Experiments._get_salt()}"
 
     def get_global_id(self) -> ID:
-        return f"experiments#{self._get_salt()}"
+        return self.make_id()
 
     def as_storable(self) -> StorableBundle:
         return StorableBundle(
@@ -406,13 +422,21 @@ class Experiments(Storable):
             entries={
                 self.get_id(): StorableEntry(
                     payload={
-                        "expeiments": [experiment.get_id() for experiment in self.experiments],
+                        "experiments": [experiment.get_id() for experiment in self.experiments],
                     },
                     type=StorableType.EXPERIMENTS,
                 ),
                 **dict(item for e in self.experiments for item in e.as_storable().entries.items()),
             },
         )
+
+    @staticmethod
+    def from_storable(
+        entry: StorableEntry, data: "database.DataDatabase", storable_type: "StorableType | None" = None
+    ) -> Self:
+        if entry.id in data and storable_type != StorableType.EXPERIMENTS:
+            return data.retrieve(entry.id)
+        return Experiments(*(data.retrieve(experiment_id) for experiment_id in entry.payload["experiments"]))
 
     def merge(self, other: "Experiments") -> "Experiments":
         self.__experiments_map.update(other.__experiments_map)
@@ -445,7 +469,8 @@ class Experiments(Storable):
 
     @staticmethod
     def from_product(
-        datasets: list['database.CompleteDataset'],
+        database: "database.DataDatabase",
+        datasets: list["database.CompleteDataset"],
         seeds: list[int],
         pool_size: int,
         cold_start_strategies: list[strategies.QueryStrategyType],
@@ -456,9 +481,13 @@ class Experiments(Storable):
     ) -> "Experiments":
         return Experiments(
             *(
-                (dataset.create_pool(database.SeededIndices(pool_size, seed, len(dataset.train))) and None) or Experiment(
+                Experiment(
                     dataset=dataset,
-                    pool=dataset.pool,
+                    pool=dataset.pool(
+                        Storable.storable_factory(
+                            database, StorableType.SEEDED_INDICES, pool_size, seed, len(dataset.train)
+                        )
+                    ),
                     cold_start_strategy=strategies.ColdStartStrategy(cs_strategy_type, batch_size=split),
                     active_learning_strategy=strategies.ActiveLearningStrategy(
                         al_strategy_type, al_batch_size, budget - split
@@ -475,18 +504,25 @@ class Experiments(Storable):
             )
         )
 
-    def run_all(self, tokenizer: "BertTokenizerFast", fine_tuning_model: str, runs: int, database: "database.DataDatabase", *, default_force: bool = False):
+    def run_all(
+        self,
+        tokenizer: "BertTokenizerFast",
+        fine_tuning_model: str,
+        runs: int,
+        database: "database.DataDatabase",
+        *,
+        default_force: bool = False,
+    ):
         for experiment in self.experiments:
             experiment_info = self.__experiments_map[Experiments.ExperimentKey.from_experiment(experiment)][2]
             force = default_force if experiment_info.force is None else experiment_info.force
-            exp: Experiment = database.retrieve(experiment)
+            exp: Experiment = database.get_experiment(experiment)
             if exp.runs >= runs and not force:
                 self.set(exp)
             else:
                 starting_point = exp.runs + 1 if exp.runs > 0 else 1
                 exp.run(tokenizer, fine_tuning_model, database, repeat=runs, from_run=starting_point)
                 database.store_fast(exp.as_storable(), Format.JSON)
-                database.experiments.add(exp) # TODO: move to from_bundle
 
     def __getitem__(self, key: "Experiments.ExperimentKey") -> tuple[Experiment, int, "Experiments.ExperimentInfo"]:
         matching = {e for e in self.__experiments_map.keys() if e.equivalent(key)}
@@ -503,25 +539,3 @@ class Experiments(Storable):
         self, key: "Experiments.ExperimentKey"
     ) -> builtins.set[tuple[Experiment, int, "Experiments.ExperimentInfo"]]:
         return {self.__experiments_map[e] for e in self.__experiments_map.keys() if e.equivalent(key)}
-
-    # def to_json(self) -> dict:
-    #     return {
-    #         "experiments": {
-    #             i: {
-    #                 "experiment": str(database.DATA_DIR / experiment.get_config_filename()),
-    #                 "info": info.to_json(),
-    #                 "key": key.to_json(),
-    #             }
-    #             for key, (experiment, i, info) in self.__experiments_map.items()
-    #         },
-    #         "root_dir": self.experiments[0].root_dir,
-    #     }
-
-    # def from_json(data: dict) -> "Experiments":
-    #     root_dir = data["root_dir"]
-    #     return Experiments(
-    #         *(
-    #             Experiment.load(root_dir, exp_data["experiment"])
-    #             for _, exp_data in sorted(data["experiments"].items(), key=lambda x: int(x[0]))
-    #         )
-    #     )

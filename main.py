@@ -1,5 +1,5 @@
-from experiments import *
 from database import *
+from experiments import *
 from strategies import *
 
 from transformers import AutoTokenizer
@@ -7,16 +7,13 @@ from transformers import AutoTokenizer
 
 def main() -> int | None:
     with DataDatabase(".") as db:
-        ag_news = db.get(DatasetID("ag_news"))
-        sst_2 = db.get(DatasetID("glue", "sst2"), text_field="sentence")
+        ag_news = db.get_dataset(DatasetID("ag_news"))
+        sst_2 = db.get_dataset(DatasetID("glue", "sst2"), text_field="sentence")
         experiments = Experiments.from_experiments(
             Experiments.from_product(
+                database=db,
                 datasets=[ag_news, sst_2],
-                seeds=[
-                    # 42, 
-                       69, 
-                    #    1337, 1147, 1984
-                    ],
+                seeds=[42, 69, 1337, 1147, 1984],
                 pool_size=1000,
                 cold_start_strategies=[
                     QueryStrategySimple(SimpleQueryStrategyType.RANDOM),
@@ -26,8 +23,7 @@ def main() -> int | None:
                 ],
                 active_learning_strategies=[MockQueryStrategyType()],
                 bugdets=[500],
-                # splits=list(range(10, 300 + 1, 10)),
-                splits=[10],
+                splits=list(range(10, 300 + 1, 10)),
                 al_batch_size=10,  # currently mock strategy
             )
         )
@@ -35,8 +31,8 @@ def main() -> int | None:
         experiments.run_all(
             AutoTokenizer.from_pretrained("google/bert_uncased_L-2_H-128_A-2"),
             "google/bert_uncased_L-2_H-128_A-2",
-            1,
-            db
+            5,
+            db,
         )
 
 

@@ -7,6 +7,7 @@ import datasets
 import numpy as np
 import numpy.typing as npt
 
+import itertools
 import hashlib
 import re
 import dataclasses
@@ -26,27 +27,8 @@ class Indices(storage.Storable):
     def __len__(self) -> int:
         return len(self.indices)
 
-    # def dump(self, root_dir: pathlib.Path, external_id: str, filename: str | None = None):
-    #     config = self.get_config(external_id)
-    #     if config["hardcoded"]:
-    #         np.save(root_dir / config["indices_file"], self.indices)
 
-    #     with open_subbuild(
-    #         root_dir / storage.DATA_DIR / (filename if filename is not None else self.get_config_filename(external_id))
-    #     ).open("w") as cfg:
-    #         json.dump(config, cfg)
-
-    # @staticmethod
-    # def load(root_dir: pathlib.Path, filename: str) -> "Indices":
-    #     with open_subbuild(root_dir / storage.DATA_DIR / filename).open("r") as cfg:
-    #         config = json.load(cfg)
-    #     if config["hardcoded"]:
-    #         indices = np.load(root_dir / config["indices_file"])
-    #         return Indices(indices=indices, repr=None)
-    #     else:
-    #         return Indices.from_seed(**config["repr"])
-
-
+@storage.Storable.make_storable(storage.StorableType.SEEDED_INDICES)
 class SeededIndices(Indices):
     def __init__(self, size: int, seed: int, dataset_size: int):
         indices = np.arange(dataset_size)
@@ -62,7 +44,11 @@ class SeededIndices(Indices):
         return storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, (size, seed, dataset_size))))
 
     def get_id(self) -> storage.ID:
-        return f"{self.seed}_{self.size}_{self.dataset_size}#{self._get_salt(self.size, self.seed, self.dataset_size)}"
+        return SeededIndices.make_id(self.size, self.seed, self.dataset_size)
+
+    @staticmethod
+    def make_id(size: int, seed: int, dataset_size: int) -> storage.ID:
+        return f"{seed}_{size}_{dataset_size}#{SeededIndices._get_salt(size, seed, dataset_size)}"
 
     def as_storable(self) -> storage.StorableBundle:
         return storage.StorableBundle(
@@ -80,7 +66,19 @@ class SeededIndices(Indices):
             },
         )
 
+    @staticmethod
+    def from_storable(
+        entry: "storage.StorableEntry", data: "DataDatabase", storable_type: storage.StorableType | None = None
+    ) -> "SeededIndices":
+        if entry.id in data and storable_type != storage.StorableType.SEEDED_INDICES:
+            return data.retrieve(entry.id)
+        payload = entry.payload
+        obj = SeededIndices(size=payload["size"], seed=payload["seed"], dataset_size=payload["dataset_size"])
+        data.encache(obj)
+        return obj
 
+
+@storage.Stringifiable.make_stringifiable()
 @dataclasses.dataclass(frozen=True, eq=True, slots=True)
 class DatasetID(storage.Stringifiable):
     path: str
@@ -101,27 +99,21 @@ class DatasetID(storage.Stringifiable):
         return DatasetID(path=path, subset=subset)
 
 
-class LLMType(storage.Stringifiable, enum.Enum, metaclass=EnumABCMeta):
+@storage.Stringifiable.make_stringifiable()
+class LLMType(storage.Stringifiable, enum.StrEnum, metaclass=EnumABCMeta):
     GIGACHAT = enum.auto()
 
-    @classmethod
-    def str_mappings(cls) -> dict[Self, str]:
-        return {
-            cls.GIGACHAT: "gigachat",
-        }
-
-    @classmethod
-    def reverse_str_mappings(cls) -> dict[str, Self]:
-        return {v: k for k, v in cls.str_mappings().items()}
-
     def __str__(self) -> str:
-        return self.str_mappings()[self]
+        return self.value
 
-    @classmethod
-    def from_str(cls: "LLMType", strategy_str: str) -> "LLMType":
-        return cls.reverse_str_mappings()[strategy_str]
+    def from_str(s: str) -> "LLMType":
+        for member in LLMType:
+            if member.value == s:
+                return member
+        raise ValueError(f"Invalid LLMType string: {s}")
 
 
+@storage.Storable.make_storable(storage.StorableType.LLM_LABELS)
 @dataclasses.dataclass
 class LLMLabels(storage.Storable):  # TODO: consider pool mapping
     dataset_id: DatasetID
@@ -152,22 +144,20 @@ class LLMLabels(storage.Storable):  # TODO: consider pool mapping
             },
         )
 
-    # def dump(self, root_dir: pathlib.Path, external_id: str, filename: str | None = None):
-    #     config = self.get_config(external_id)
-    #     with (
-    #         open_subbuild(
-    #             root_dir / storage.DATA_DIR / (filename if filename is not None else self.get_config_filename(external_id))
-    #         ).open("w") as cfg,
-    #         open_subbuild(root_dir / config["labels"]).open("wb") as lf,
-    #     ):
-    #         json.dump(config, cfg)
-    #         np.save(lf, self.labels)
-
-    # @staticmethod
-    # def load(root_dir: pathlib.Path, filename: str) -> "LLMLabels":
-    #     with (root_dir / storage.DATA_DIR / filename).open("r") as cfg:
-    #         config = json.load(cfg)
-    #     return LLMLabels(llm=LLMType.from_str(config["llm"]), labels=np.load(root_dir / config["labels"]))
+    @staticmethod
+    def from_storable(
+        entry: storage.StorableEntry, data: "DataDatabase", storable_type: storage.StorableType | None = None
+    ) -> "LLMLabels":
+        if entry.id in data and storable_type != storage.StorableType.LLM_LABELS:
+            return data.retrieve(entry.id)
+        payload = entry.payload
+        obj = LLMLabels(
+            dataset_id=DatasetID.from_str(payload["dataset_id"]),
+            llm=LLMType.from_str(payload["llm"]),
+            labels=data.retrieve(payload["labels"]).payload["array"],
+        )
+        data.encache(obj)
+        return obj
 
     def __eq__(self, value):
         if not isinstance(value, LLMLabels):
@@ -216,6 +206,7 @@ class Dataset(Protocol):
         )
 
 
+@storage.Storable.make_storable(storage.StorableType.POOL)
 class Pool(storage.Storable):
     def __init__(self, indices: Indices, dataset: Dataset):
         self.indices = indices
@@ -249,17 +240,21 @@ class Pool(storage.Storable):
     @staticmethod
     def _get_salt(dataset_id: DatasetID, indices_id: storage.ID) -> storage.Hash:
         return storage.Storable.combine_hashes(
-            storage.Storable.hash_str(str(dataset_id)), storage.Storable.hash_str(indices_id)
+            storage.Storable.hash_str(CompleteDataset.make_id(dataset_id)), storage.Storable.hash_str(indices_id)
         )
 
     def get_id(self) -> storage.ID:
-        return f"{self.base.id}__{self.indices.get_id()}#{self._get_salt(self.base.id, self.indices.get_id())}"
+        return self.make_id(self.base.id, self.indices.get_id())
+
+    @staticmethod
+    def make_id(dataset_id: DatasetID, indices_id: storage.ID) -> storage.ID:
+        return f"{dataset_id}__{indices_id}#{Pool._get_salt(dataset_id, indices_id)}"
 
     def as_storable(self) -> storage.StorableBundle:
         indices_entry = self.indices.as_storable()
         dataset_entry = storage.StorableEntry(
             payload={
-                "dataset_id": str(self.base.id),
+                "dataset_id": CompleteDataset.make_id(self.base.id),
                 "indices": self.indices.get_id(),
             },
             type=storage.StorableType.POOL,
@@ -270,7 +265,20 @@ class Pool(storage.Storable):
             entries={
                 self.get_id(): dataset_entry,
                 **indices_entry.entries,
+                **self.base.as_storable().entries,
             },
+        )
+
+    @staticmethod
+    def from_storable(
+        entry: storage.StorableEntry, data: "DataDatabase", storable_type: storage.StorableType | None = None
+    ) -> "Pool":
+        if entry.id in data and storable_type != storage.StorableType.POOL:
+            return data.retrieve(entry.id)
+        payload = entry.payload
+        return Pool(
+            indices=data.retrieve(payload["indices"]),
+            dataset=data.retrieve(payload["dataset_id"]).train,
         )
 
     def to_transformers_dataset(
@@ -300,49 +308,10 @@ class Pool(storage.Storable):
     #         return self.__annotations
     #     raise ValueError("Cannot get annotations without base dataset")
 
-    # def dump(self, root_dir: pathlib.Path, external_id: str, filename: str | None = None):
-    #     config = self.get_config(external_id)
-    #     with open_subbuild(
-    #         root_dir / storage.DATA_DIR / (filename if filename is not None else self.get_config_filename(external_id))
-    #     ).open("w") as cfg:
-    #         json.dump(config, cfg)
-    #     self.indices.dump(root_dir, external_id)
-    #     for key, file in config["pool_files"].items():
-    #         self.pool.dataset[key].save_to_disk(root_dir / file)
-    #     for llm, file in config["annotations"].items():
-    #         self.annotations[LLMType.from_str(llm)].dump(root_dir, external_id)
 
-    # @staticmethod
-    # def load(root_dir: pathlib.Path, filename: str, dataset: CompleteDataset | None = None) -> "Pool":
-    #     config_path = filename if filename.is_absolute() else root_dir / filename
-    #     with config_path.open("r") as cfg:
-    #         config = json.load(cfg)
-    #     indices_file = pathlib.Path(config["indices_file"])
-
-    #     if indices_file.parents[-2] == storage.DATA_DIR:
-    #         indices_file = indices_file.relative_to(storage.DATA_DIR)
-    #     indices = Indices.load(root_dir, indices_file)
-    #     pool_data = datasets.DatasetDict()
-    #     for key, file in config["pool_files"].items():
-    #         pool_data[key] = datasets.Dataset.load_from_disk(root_dir / file)
-    #     pool = Pool(indices=indices, dataset=dataset)
-    #     pool.__pool = pool_data
-    #     pool.__annotations = {
-    #         LLMType.from_str(llm_str): LLMLabels.load(
-    #             root_dir,
-    #             (
-    #                 pathlib.Path(label_file).relative_to(storage.DATA_DIR)
-    #                 if pathlib.Path(label_file).parents[-2] == storage.DATA_DIR
-    #                 else label_file
-    #             ),
-    #         )
-    #         for llm_str, label_file in config["annotations"].items()
-    #     }
-    #     return pool
-
-
-class CompleteDataset(storage.Storable):
-    def __init__(self, id: DatasetID, text_field: str, label_field: str):  # TODO: pass storage object
+@storage.Storable.make_storable(storage.StorableType.DATASET)
+class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
+    def __init__(self, id: DatasetID, text_field: str, label_field: str, database: "DataDatabase"):
         self.id = id
         self.text_field = text_field
         self.label_field = label_field
@@ -350,7 +319,7 @@ class CompleteDataset(storage.Storable):
         self.__annotations = None
         self.__train = None
         self.__validation = None
-        self.__pool = None
+        self.__database = database
 
     @property
     def annotations(self) -> dict[LLMType, LLMLabels]:  # TODO: pass storage object
@@ -393,24 +362,24 @@ class CompleteDataset(storage.Storable):
         self.__dataset = self.__standardize_dataset(self.__dataset)
         return self.__dataset
 
-    def create_pool(self, indices: Indices) -> Pool:
-        if self.__pool is not None:
-            print("[WARNING]: Pool already exists for this dataset, overwriting")
-        self.__pool = Pool(indices=indices, dataset=self.train)
-        return self.__pool
-
-    @property
-    def pool(self) -> Pool:
-        if self.__pool is None:
-            raise ValueError("Firstly create pool via Dataset.create_pool method")
-        return self.__pool
+    def pool(self, indices: Indices) -> Pool:
+        id = Pool.make_id(self.id, indices.get_id())
+        if id in self.__database:
+            return self.__database.retrieve(id)
+        obj = Pool(indices, self.train)
+        self.__database.encache(obj)
+        return obj
 
     @staticmethod
     def _get_salt(dataset_id: DatasetID) -> storage.Hash:
         return storage.Storable.hash_str(str(dataset_id))
 
     def get_id(self) -> storage.ID:
-        return f"{self.id}#{self._get_salt(self.id)}"
+        return self.make_id(self.id)
+
+    @staticmethod
+    def make_id(dataset_id: DatasetID) -> storage.ID:
+        return f"{dataset_id}#{CompleteDataset._get_salt(dataset_id)}"
 
     def as_storable(self) -> storage.StorableBundle:  # TODO: annotations
         return storage.StorableBundle(
@@ -428,6 +397,22 @@ class CompleteDataset(storage.Storable):
             },
         )
 
+    @staticmethod
+    def from_storable(
+        entry: storage.StorableEntry, data: "DataDatabase", storable_type: storage.StorableType | None = None
+    ) -> "CompleteDataset":
+        if entry.id in data and storable_type != storage.StorableType.DATASET:
+            return data.retrieve(entry.id)
+        payload = entry.payload
+        obj = CompleteDataset(
+            id=DatasetID.from_str(payload["dataset"]),
+            text_field=payload["text_field"],
+            label_field=payload["label_field"],
+            database=data,
+        )
+        data.encache(obj)
+        return obj
+
     def __standardize_dataset(self, dataset: datasets.DatasetDict) -> datasets.DatasetDict:
         return dataset.map(
             lambda ex: {
@@ -437,28 +422,8 @@ class CompleteDataset(storage.Storable):
             remove_columns=dataset["train"].column_names,
         )
 
-    # def dump(self, root_dir: pathlib.Path, filename: str | None = None):
-    #     config = self.get_config()
-    #     with open_subbuild(root_dir, storage.DATA_DIR, filename if filename is not None else self.get_config_filename()).open(
-    #         "w"
-    #     ) as df:
-    #         json.dump(config, df)
-    #     for labels in self.annotations.values():
-    #         labels.dump(root_dir, str(self.id))
 
-    # @staticmethod
-    # def load(root_dir: pathlib.Path, filename: str) -> "CompleteDataset":
-    #     with (root_dir / filename).open("r") as df:
-    #         config = json.load(df)
-    #     dataset = CompleteDataset(
-    #         id=DatasetID.from_str(config["id"]),
-    #         text_field=config["text_field"],
-    #         label_field=config["label_field"],
-    #     )
-    #     dataset.__load_annotations(config)
-    #     return dataset
-
-
+@storage.Storable.make_storable(storage.StorableType.DATASETS)
 class Datasets(storage.Storable):
     def __init__(self, *datasets: CompleteDataset):
         self.datasets = {dataset.id: dataset for dataset in datasets}
@@ -487,7 +452,11 @@ class Datasets(storage.Storable):
         return storage.Storable.hash_str("datasets")
 
     def get_id(self) -> storage.ID:
-        return f"datasets#{self._get_salt()}"
+        return self.make_id()
+
+    @staticmethod
+    def make_id() -> storage.ID:
+        return f"datasets#{Datasets._get_salt()}"
 
     def as_storable(self) -> storage.StorableBundle:
         return storage.StorableBundle(
@@ -495,7 +464,10 @@ class Datasets(storage.Storable):
             entries={
                 self.get_id(): storage.StorableEntry(
                     payload={
-                        "datasets": {str(dataset_id): str(dataset.id) for dataset_id, dataset in self.datasets.items()},
+                        "datasets": {
+                            str(dataset_id): CompleteDataset.make_id(dataset.id)
+                            for dataset_id, dataset in self.datasets.items()
+                        },
                     },
                     type=storage.StorableType.DATASETS,
                 ),
@@ -503,12 +475,24 @@ class Datasets(storage.Storable):
             },
         )
 
+    @staticmethod
+    def from_storable(
+        entry: storage.StorableEntry, data: "DataDatabase", storable_type: storage.StorableType | None = None
+    ) -> "Datasets":
+        if entry.id in data and storable_type != storage.StorableType.DATASETS:
+            return data.retrieve(entry.id)
+        payload = entry.payload
+        obj = Datasets(data.retrieve(dataset_entry_id) for dataset_entry_id in payload["datasets"].values())
+        data.encache(obj)
+        return obj
+
 
 class DataDatabase:
     BACKUPS_COUNT = 5
 
     def __init__(self, root_dir: pathlib.Path, local: bool = True):  # TODO  implement remote
-        self.objects_store: dict[storage.ID, storage.CacheEntry] = {}
+        self.objects_store: dict[storage.ID, storage.Storable] = {}
+        self.stored_index: dict[storage.ID, storage.StoredEntry] = {}
         self.root_dir = root_dir
         self.local = local
         self.__connected = False
@@ -527,317 +511,276 @@ class DataDatabase:
             self.__experiments = experiments.Experiments()
         return self.__experiments
 
-    def store_fast(self, obj: storage.StorableBundle, format: storage.Format, obj_id: storage.ID | None = None):
-        if obj_id is not None and obj_id in self.objects_store:
-            return
+    def retrieve(self, id: storage.ID) -> storage.Storable:
+        if id in self.objects_store:
+            return self.objects_store[id]
+        if id in self.stored_index:
+            obj = storage.Storable.restore(self.stored_index[id].obj, self, self.stored_index[id].obj.type)
+            if id not in self.objects_store:
+                self.encache(obj)
+            if isinstance(obj, CompleteDataset) and obj.id not in self.datasets:
+                self.datasets.add(obj)
+            if isinstance(obj, experiments.Experiment) and obj not in self.experiments:
+                self.experiments.add(obj)
+            return obj
+        raise KeyError(f"Object with id {id} not found in the database")
 
+    def encache(self, obj: storage.Storable):
+        if obj.get_id() in self.objects_store:
+            raise ValueError(f"Object with id {obj.get_id()} already exists in the cache")
+        self.objects_store[obj.get_id()] = obj
+        if obj.get_id() not in self.stored_index:
+            self.add_to_store_index(obj.as_storable())
+
+        if isinstance(obj, CompleteDataset):
+            if obj.id not in self.datasets:
+                self.datasets.add(obj)
+        elif isinstance(obj, experiments.Experiment):
+            if obj not in self.experiments:
+                self.experiments.add(obj)
+
+    def add_to_store_index(self, obj: storage.StorableBundle | storage.StorableEntry, *, force: bool = False):
+        if isinstance(obj, storage.StorableEntry):
+            if force or obj.id not in self.stored_index:
+                self.stored_index[obj.id] = storage.StoredEntry(obj, stored=False, format=None)
+            return
+        if isinstance(obj, storage.StorableBundle):
+            self.__add_to_store_index_rec(obj.main, obj, force=force)
+            return
+        raise ValueError("Object must be either StorableEntry or StorableBundle")
+
+    def __add_to_store_index_rec(self, key: storage.ID, bundle: storage.StorableBundle, *, force: bool = False):
+        if key in self.stored_index and not force:
+            return
+        entry = bundle.entries[key]
+        self.add_to_store_index(entry, force=force)
+        for ref in entry.get_references():
+            self.__add_to_store_index_rec(ref, bundle, force=force)
+
+    def __contains__(self, obj: "storage.ID | experiments.Experiment | DatasetID") -> bool:
+        if isinstance(obj, storage.ID):
+            return obj in self.objects_store or obj in self.stored_index
+        if isinstance(obj, experiments.Experiment):
+            return obj in self.experiments
+        elif isinstance(obj, DatasetID):
+            return obj in self.datasets
+        return NotImplemented
+
+    def store_fast(self, obj: "storage.StorableBundle", format: storage.Format, obj_id: storage.ID | None = None):
+        if obj_id is not None and obj_id in self.stored_index and not self.stored_index[obj_id].stored:
+            return
         if obj_id is None:
             obj_id = obj.main
+        self.__store_entry(obj.entries[obj_id], format)
+        for ref in obj.entries[obj_id].get_references():
+            self.store_fast(obj, format.switch_format(obj.entries[ref].type), ref)
+        if obj_id not in self.stored_index:
+            self.stored_index[obj_id] = storage.StoredEntry(obj.entries[obj_id], stored=True, format=format)
+        else:
+            self.stored_index[obj_id].stored = True
+            self.stored_index[obj_id].format = format
 
-        cache_entry = storage.CacheEntry(obj=obj.entries[obj_id], meta=storage.CacheMetadata(stored=False, format=None))
-        self.objects_store[obj_id] = cache_entry
-        self.__store_entry(obj, cache_entry.obj, format)
-        self.objects_store[obj_id].meta.stored = True
-        self.objects_store[obj_id].meta.format = format
-        if obj.entries[obj_id].type == storage.StorableType.EXPERIMENT:
-            ...  # TODO: from_storable
-        if obj.entries[obj_id].type == storage.StorableType.EXPERIMENT_HISTORY:
-            ...  # TODO: create experiment and add
+    def __store_entry(self, obj: "storage.StorableEntry", format: storage.Format):
+        where = self.root_dir / storage.DATA_DIR / self.__get_directory(obj.type) / format.format_name(obj.id, obj.type)
+        self.__pre_store_entry(obj, where)
+        storage.Formatter.dump(obj, format, where)
+        self.__post_store_entry(obj, where)
 
-    def __store_entry(self, bundle: storage.StorableBundle, entry: storage.StorableEntry, format: storage.Format):
-        filepath = self.root_dir / storage.DATA_DIR
-        match entry.type:
+    def __get_directory(self, entry_type: storage.StorableType) -> pathlib.Path:
+        match entry_type:
             case storage.StorableType.ARRAY:
-                filepath = filepath / "bin"
-                if format != storage.Format.NPZ:
-                    raise ValueError("Only NPZ format is supported for arrays")
-            case t if t in (storage.StorableType.POOL, storage.StorableType.SEEDED_INDICES):
-                filepath = filepath / "markup"
+                return pathlib.Path("bin")
+            case storage.StorableType.POOL | storage.StorableType.SEEDED_INDICES:
+                return pathlib.Path("markup")
             case storage.StorableType.EXPERIMENT_HISTORY:
-                filepath = filepath / "experiments" / "hisories"
+                return pathlib.Path("experiments", "histories")
             case storage.StorableType.DATASET:
-                filepath = filepath / "datasets"
-            case t if t in (storage.StorableType.DATASETS, storage.StorableType.EXPERIMENTS):
-                pass
+                return pathlib.Path("datasets")
+            case storage.StorableType.DATASETS | storage.StorableType.EXPERIMENTS:
+                return pathlib.Path()
             case storage.StorableType.LLM_LABELS:
-                ...  # TODO: store labels
+                assert False  # TODO: implement label storing
             case storage.StorableType.EXPERIMENT:
-                filepath = filepath / "experiments"
-            case storage.StorableType.EXPERIMENT_HISTORY:
-                filepath = filepath / "experiments" / "histories"
-        filepath /= format.format_name(entry.id, entry.type)
-        match entry.type:
-            case storage.StorableType.DATASET:
-                ...  # TODO: implement move logic that is in 677 to 716
-            case t if t in (
-                storage.StorableType.POOL,
-                storage.StorableType.SEEDED_INDICES,
-                storage.StorableType.EXPERIMENT_HISTORY,
-                storage.StorableType.ARRAY,
-                storage.StorableType.EXPERIMENT,
-                storage.StorableType.EXPERIMENT_HISTORY,
-            ):
-                storage.Formatter.dump(entry, format, filepath)
+                return pathlib.Path("experiments")
+            case _:
+                assert False, "unreachable"
 
-        match entry.type:
-            case storage.StorableType.POOL:
-                self.store_fast(bundle, format, entry.payload["indices"])
-            case t if t in (
-                storage.StorableType.SEEDED_INDICES,
-                storage.StorableType.EXPERIMENT_HISTORY,
-                storage.StorableType.DATASET,
-                storage.StorableType.ARRAY,
-            ):
-                pass
-            case storage.StorableType.DATASETS:
-                for dataset_id in bundle.entries[bundle.main].payload["datasets"]:
-                    self.store_fast(bundle, format, dataset_id)
-            case storage.StorableType.EXPERIMENTS:
-                for experiment_id in bundle.entries[bundle.main].payload["experiments"]:
-                    self.store_fast(bundle, format, experiment_id)
-            case storage.StorableType.EXPERIMENT:
-                for history_id in bundle.entries[bundle.main].payload["histories"].values():
-                    self.store_fast(bundle, format, history_id)
-            case storage.StorableType.LLM_LABELS:
-                ...  # TODO
+    def __pre_store_entry(self, obj: "storage.StorableEntry", where: pathlib.Path):
+        where.parent.mkdir(parents=True, exist_ok=True)
+
+    def __post_store_entry(self, obj: "storage.StorableEntry", where: pathlib.Path):
+        pass
+
+    def dump(self):
+        path = self.root_dir / storage.DATA_DIR / f"{self.get_config_name()}.json"
+        last_backup_id = self.__pre_dump(path)
+        if not self.local:
+            assert False, "TODO: implement remote"
+        config = self.__generate_storables(last_backup_id + 1)
+        for entry in self.stored_index.values():
+            if not entry.stored and not entry.obj.type.is_groupable():
+                format = storage.Format.JSON.switch_format(entry.obj.type)
+                self.__store_entry(entry.obj, format)
+                entry.stored = True
+                entry.format = format
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w") as dbf:
+            json.dump(config, dbf)
+        self.__post_dump(last_backup_id + 1)
+
+    def __pre_dump(self, path: pathlib.Path) -> int:
+        if not self.local:
+            assert False, "TODO: implement remote"
+        backup_id = 0
+        if path.exists():
+            with path.open("r") as dbf:
+                old_config = json.load(dbf)
+            backup_id = old_config.get("backup_id", 1)
+            path.rename(path.parent / f"{self.get_config_name()}_{backup_id + 1}.json")
+        for obj in self.objects_store.values():
+            self.add_to_store_index(obj.as_storable(), force=True)
+
+        return backup_id
+
+    def __post_dump(self, backup_id: int):
+        if not self.local:
+            assert False, "TODO: implement remote"
+        # breakpoint()
+        killable_old = self.root_dir / storage.DATA_DIR / f"{self.get_config_name()}_{backup_id - 4}.json"
+        if killable_old.exists():
+            killable_old.unlink()
 
     def recollect_stored(self): ...  # TODO
 
-    def retrieve(self, experiment: "experiments.Experiment") -> "experiments.Experiment":
-        if experiment in self.experiments:
-            key = experiments.Experiments.ExperimentKey.from_experiment(experiment)
-            return self.experiments[key][0]
-        return experiment
+    def get_dataset(self, obj: DatasetID, text_field: str = "text", label_field: str = "label") -> CompleteDataset:
+        if obj in self.datasets:
+            return self.datasets.datasets[obj]
+        dataset = CompleteDataset(
+            id=obj,
+            text_field=text_field,
+            label_field=label_field,
+            database=self,
+        )
+        self.encache(dataset)
 
-    def __contains__(self, experiment: "experiments.Experiment | DatasetID") -> bool:
-        if isinstance(experiment, experiments.Experiment):
-            return experiment in self.experiments
-        elif isinstance(experiment, DatasetID):
-            return experiment in self.datasets
+        return dataset
 
-    def get(self, obj: DatasetID, text_field: str = "text", label_field: str = "label") -> CompleteDataset:
-        if isinstance(obj, DatasetID):
-            if obj in self.datasets:
-                return self.datasets.datasets[obj]
-            dataset = CompleteDataset(
-                id=obj,
-                text_field=text_field,
-                label_field=label_field,
-            )
-            self.datasets.add(dataset)
-            self.objects_store.update(
-                {
-                    id: storage.CacheEntry(
-                        obj=entry, meta=storage.CacheMetadata(stored=False, format=storage.Format.JSON)
-                    )
-                    for id, entry in dataset.as_storable().entries.items()
-                }
-            )
-
-            return dataset
+    def get_experiment(self, obj: "experiments.Experiment") -> "experiments.Experiment":
+        if obj in self.experiments:
+            return self.experiments[experiments.Experiments.ExperimentKey.from_experiment(obj)][0]
+        self.encache(obj)
+        return obj
 
     @staticmethod
     def get_config_name() -> str:
         return "DONT_EVER_TOUCH_THIS_FILE_database8=D"
 
-    def generate_storables(self, backup_id) -> dict:
+    def __generate_storables(self, backup_id) -> dict:
         return {
             "backup_id": backup_id,
-            "backup_file": f"{self.get_config_name()}_{backup_id}.json",
             "objects": {
                 id: {
                     "type": entry.obj.type.value,
                     "payload": entry.obj.payload,
                 }
-                for id, entry in self.objects_store.items()
-                if not entry.meta.stored
+                for id, entry in self.stored_index.items()
+                if not entry.stored and entry.obj.type.is_groupable()
             },
-            "experiments": [
-                id
-                for id, entry in self.objects_store.items()
-                if entry.obj.type == storage.StorableType.EXPERIMENT
-            ],
-            "databases": {
-                id: entry.obj.payload['dataset']
-                for id, entry in self.objects_store.items()
-                if entry.obj.type == storage.StorableType.DATASET
-            }
+            "refs": {
+                id: {
+                    "path": str(self.__get_directory(entry.obj.type) / entry.format.format_name(id, entry.obj.type)),
+                    "format": entry.format.value,
+                    # TODO: consider remote
+                }
+                for id, entry in self.stored_index.items()
+                if entry.stored or not entry.obj.type.is_groupable()
+            },
+            "experiments": [exp.get_id() for exp in self.experiments],
+            "datasets": [dataset.get_id() for dataset in self.datasets],
         }
 
-    def connect(self) -> "DataDatabase":
-        if self.__connected:
-            raise RuntimeError("Database is already connected, cannot connect again")
-        self.__connected = True
-        if not self.local:  # TODO: implement remote
-            raise NotImplementedError("Remote databases are not implemented yet")
-        if (self.root_dir / storage.DATA_DIR / f"{DataDatabase.get_config_name()}.json").exists():
-            self.load()
-        return self
-
-    def __enter__(self):
-        return self.connect()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        for id, entry in self.objects_store.items():
-            if not entry.meta.stored:
-                self.__store_entry(
-                    storage.StorableBundle(main=id, entries={id: entry.obj}),
-                    entry.obj,
-                    storage.Format.JSON if entry.obj.type != storage.StorableType.ARRAY else storage.Format.NPZ,
-                )
-        # TODO: save datasets and experiments
-        self.dump()
-        self.__connected = False
-
-    def dump(self): # TODO: remove old files
-        path = self.root_dir / storage.DATA_DIR / f"{self.get_config_name()}.json"
-        if not self.local:
-            ...  # TODO: implement remote
-        old_config = {}
-        if path.exists():
-            with path.open("r") as dbf:
-                old_config = json.load(dbf)
-            old_path = path.rename(
-                self.root_dir / storage.DATA_DIR / f"{self.get_config_name()}_{old_config['backup_id'] + 1}.json"
-            )
-        last_backup_id = old_config.get("backup_id", 1)
-        config = self.generate_storables(last_backup_id + 1)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w") as dbf:
-            json.dump(config, dbf)
-
-    def load(self):
-        if not self.local:  # TODO: implement remote
-            raise NotImplementedError("Remote databases are not implemented yet")
-        db = DataDatabase(self.root_dir, self.local)
-        config_path = self.root_dir / storage.DATA_DIR / f"{db.get_config_name()}.json"
+    @classmethod
+    def load(cls, config_path: pathlib.Path, root_dir: pathlib.Path, local: bool = True) -> "DataDatabase":
+        if not local:
+            assert False, "TODO: implement remote"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file {config_path} does not exist")
         with config_path.open("r") as dbf:
             config = json.load(dbf)
-        for id, entry in config["objects"].items():
-            ...  # TODO: implement from_storable
+        db = cls(root_dir, local)
+        db.__load_config(config)
+        return db
 
-    # @staticmethod
-    # def __is_experiments_subset(cfg1: dict, cfg2: dict) -> bool:
-    #     return cfg1["root_dir"] == cfg2["root_dir"] and set(cfg1["experiments"]).issubset(set(cfg2["experiments"]))
+    def __load_config(self, config: dict):
+        for id, obj in config["objects"].items():
+            self.stored_index[id] = storage.StoredEntry(
+                obj=storage.StorableEntry(
+                    payload=obj["payload"],
+                    type=storage.StorableType(obj["type"]),
+                    id=id,
+                ),
+                stored=False,
+                format=None,
+            )
+        for id in config["refs"]:
+            self.__load_from_disk(config, id)  # TODO: consider adding refs not to load everything on start
+        for id in config["experiments"]:
+            if id not in self.objects_store:
+                obj = storage.Storable.restore(self.stored_index[id].obj, self)
+                if obj.get_id() not in self.objects_store:
+                    self.encache(obj)
+                if obj not in self.experiments:
+                    self.experiments.add(obj)
+        for id in config["datasets"]:
+            if id not in self.objects_store:
+                obj = storage.Storable.restore(self.stored_index[id].obj, self)
+                if obj.get_id() not in self.objects_store:
+                    self.encache(obj)
+                if obj not in self.datasets:
+                    self.datasets.add(obj)
 
-    # @staticmethod
-    # def __is_datasets_subset(cfg1: dict, cfg2: dict, root_dir: pathlib.Path, datasets: Datasets) -> bool:
-    #     if not set(cfg1["datasets"]).issubset(set(cfg2["datasets"])):
-    #         return False
-    #     for key in cfg1["datasets"]:
-    #         ds1 = CompleteDataset.load(root_dir, cfg1["datasets"][key])
-    #         ds2 = datasets[DatasetID.from_str(key)]
-    #         annot1 = ds1.annotations
-    #         annot2 = ds2.annotations
-    #         if set(annot1) != set(annot2):
-    #             return False
+    def __load_from_disk(self, config: dict, id: storage.ID):
+        if not self.local:
+            assert False, "TODO: implement remote"
 
-    #         if not all(annot1[llm] == annot2[llm] for llm in annot1):
-    #             return False
-    #     return True
+        if id not in config["refs"]:
+            raise KeyError(f"Object with id {id} not found in config")
+        content = config["refs"][id]
+        format = storage.Format(config["refs"][id]["format"])
+        path: pathlib.Path = self.root_dir / storage.DATA_DIR / content["path"]
+        entry = storage.Formatter.load(format, path)
+        self.stored_index[id] = storage.StoredEntry(obj=entry, stored=True, format=format)
 
-    # def dump(self, root_dir: pathlib.Path, filename: str | None = None):
-    #     config = self.get_config()
-    #     if (self.root_dir / storage.DATA_DIR / self.get_config_filename()).exists():
-    #         (self.root_dir / storage.DATA_DIR / self.get_config_filename()).rename(
-    #             self.root_dir / storage.DATA_DIR / config["backup_file"]
-    #         )
-    #     if (
-    #         self.root_dir
-    #         / storage.DATA_DIR
-    #         / f"{self.get_config_filename()[:-5]}_{(config['backup_id'] - self.BACKUPS_COUNT)}.json"
-    #     ).exists():
-    #         (
-    #             self.root_dir
-    #             / storage.DATA_DIR
-    #             / f"{self.get_config_filename()[:-5]}_{(config['backup_id'] - self.BACKUPS_COUNT)}.json"
-    #         ).unlink()
-
-    #     with open_subbuild(
-    #         root_dir / storage.DATA_DIR / (filename if filename is not None else self.get_config_filename())
-    #     ).open("w") as dbf:
-    #         json.dump(config, dbf)
-
-    #     old_exp_path = root_dir / storage.DATA_DIR / self.EXPERIMENTS_FILE
-    #     if old_exp_path.exists():
-    #         with old_exp_path.open("r") as ef:
-    #             old_experiments = json.load(ef)
-
-    #     experiments = self.experiments.to_json()
-    #     if old_exp_path.exists() and not DataDatabase.__is_experiments_subset(old_experiments, experiments):
-    #         new_filename = f"{self.get_config_filename()[:-5]}_{uuid.uuid4()}.json"
-    #         print(f"WARNING: Some experiments are missing, saved previous file in {new_filename}")
-    #         (self.root_dir / storage.DATA_DIR / self.EXPERIMENTS_FILE).rename(self.root_dir / storage.DATA_DIR / new_filename)
-
-    #     with open_subbuild(root_dir / storage.DATA_DIR / self.EXPERIMENTS_FILE).open("w") as ef:
-    #         json.dump(self.experiments.to_json(), ef)
-
-    #     old_datasets_path = root_dir / storage.DATA_DIR / self.DATASETS_FILE
-    #     if old_datasets_path.exists():
-    #         with old_datasets_path.open("r") as df:
-    #             old_datasets = json.load(df)
-
-    #     datasets_config = old_datasets if old_datasets_path.exists() else self.datasets.to_json()
-
-    #     if old_datasets_path.exists() and not DataDatabase.__is_datasets_subset(
-    #         old_datasets, self.datasets.to_json(), root_dir, self.datasets
-    #     ):
-    #         salt = f"{uuid.uuid4()}"
-    #         new_filename = f"{self.get_config_filename()[:-5]}_{salt}.json"
-    #         print(
-    #             f"WARNING: Some datasets are missing or have different annotations, saved previous file in {new_filename}"
-    #         )
-    #         (self.root_dir / storage.DATA_DIR / self.DATASETS_FILE).rename(self.root_dir / storage.DATA_DIR / new_filename)
-    #         for dataset_id in old_datasets["datasets"]:
-    #             renamed = False
-    #             ds1 = CompleteDataset.load(root_dir, old_datasets["datasets"][dataset_id])
-    #             ds2 = self.datasets[DatasetID.from_str(dataset_id)]
-    #             annot1 = ds1.annotations
-    #             annot2 = ds2.annotations
-    #             cfg1 = ds1.get_config()
-    #             for llm in annot1:
-    #                 if not (annot1[llm] == annot2[llm]):
-    #                     print(
-    #                         f"WARNING: Annotations for dataset {dataset_id} and LLM {llm} differ between old and new database"
-    #                     )
-    #                     filename = cfg1["annotations"][str(llm)]
-    #                     new_annotations_filename = f"{filename[:-5]}_{salt}.json"
-    #                     (self.root_dir / storage.DATA_DIR / filename).rename(
-    #                         self.root_dir / storage.DATA_DIR / new_annotations_filename
-    #                     )
-    #                     if not renamed:
-    #                         new_dataset_filename = f"{old_datasets['datasets'][dataset_id][:-5]}_{salt}.json"
-    #                         (self.root_dir / storage.DATA_DIR / old_datasets["datasets"][dataset_id]).rename(
-    #                             self.root_dir / storage.DATA_DIR / new_dataset_filename
-    #                         )
-
-    #                         renamed = True
-    #                     cfg1["annotations"][str(llm)] = new_annotations_filename
-    #             if renamed:
-    #                 with open_subbuild(self.root_dir / storage.DATA_DIR / new_dataset_filename).open("w") as df:
-    #                     json.dump(cfg1, df)
-    #                 datasets_config["datasets"][dataset_id] = ds1.get_config_filename()
-
-    #     with open_subbuild(root_dir / storage.DATA_DIR / self.DATASETS_FILE).open("w") as df:
-    #         json.dump(datasets_config, df)
-    #     if self.__enter:
-    #         return
-    #     for dataset in self.datasets:
-    #         dataset.dump(root_dir, datasets_config["datasets"][str(dataset.id)])
-
-    # @staticmethod
-    # def load(root_dir: pathlib.Path, filename: str) -> "DataDatabase":
-    #     raise RuntimeError("Use DataDatabase(root_dir) instead of load")
-
-    # def __enter__(self) -> "DataDatabase":
-    #     self.__enter = True
-    #     self.__exit_stack = contextlib.ExitStack()
-    #     for dataset in self.datasets:
-
-    #         self.__exit_stack.enter_context(dataset(self.root_dir))
+    # def connect(self) -> "DataDatabase":
+    #     if self.__connected:
+    #         raise RuntimeError("Database is already connected, cannot connect again")
+    #     self.__connected = True
+    #     if not self.local:  # TODO: implement remote
+    #         raise NotImplementedError("Remote databases are not implemented yet")
+    #     if (self.root_dir / storage.DATA_DIR / f"{DataDatabase.get_config_name()}.json").exists():
+    #         self.load()
     #     return self
 
-    # def __exit__(self, exc_type, exc_value, traceback):
-    #     self.__enter = False
-    #     self.__exit_stack.close()
-    #     self.dump(self.root_dir)
+    def __enter__(self):
+        if not self.local:  # TODO: implement remote
+            raise NotImplementedError("Remote databases are not implemented yet")
+
+        path = self.root_dir / storage.DATA_DIR / f"{self.get_config_name()}.json"
+        if path.exists():
+            tmp = DataDatabase.load(path, self.root_dir, self.local)
+            self.objects_store = tmp.objects_store
+            self.stored_index = tmp.stored_index
+            self.__datasets = tmp.__datasets
+            self.__experiments = tmp.__experiments
+            tmp.objects_store = {}
+            tmp.stored_index = {}
+            tmp.__datasets = None
+            tmp.__experiments = None
+        self.__connected = True
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if not self.local:  # TODO: implement remote
+            raise NotImplementedError("Remote databases are not implemented yet")
+        self.dump()
+        self.__connected = False
