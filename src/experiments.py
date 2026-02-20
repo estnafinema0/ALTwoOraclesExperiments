@@ -535,6 +535,15 @@ class Experiments(Storable):
             key = Experiments.ExperimentKey.from_experiment(key)
         return any(e == key for e in self.__experiments_map.keys())
 
+    def __delitem__(self, key: "Experiments.ExperimentKey"):
+        matching = {e for e in self.__experiments_map.keys() if e.equivalent(key)}
+        if len(matching) != 1:
+            raise KeyError(f"Key {key} is ambiguous, matches {len(matching)} experiments")
+        key = matching.pop()
+        _, idx, _ = self.__experiments_map[key]
+        del self.__experiments_map[key]
+        self.experiments.pop(idx)
+
     def matching(
         self, key: "Experiments.ExperimentKey"
     ) -> builtins.set[tuple[Experiment, int, "Experiments.ExperimentInfo"]]:

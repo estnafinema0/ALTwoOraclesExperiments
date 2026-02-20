@@ -34,7 +34,7 @@ class StorableType(enum.StrEnum):
         return self not in (StorableType.ARRAY, StorableType.EXPERIMENTS, StorableType.DATASETS)
 
 
-@dataclasses.dataclass(slots=True, frozen=True)
+@dataclasses.dataclass(slots=True, frozen=True, eq=True)
 class StorableEntry:
     payload: dict
     type: StorableType
@@ -67,7 +67,7 @@ class StorableEntry:
                 assert False, "unreachable"
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass(slots=True, eq=True)
 class StorableBundle:
     main: str
     entries: dict[ID, StorableEntry]
@@ -225,6 +225,15 @@ class Format(enum.Enum):
             case _:
                 assert False, "unreachable"
 
+    @staticmethod
+    def format_from_format_name(filename: str) -> Self:
+        if filename.endswith(".npz"):
+            return Format.NPZ
+        elif filename.endswith(".json"):
+            return Format.JSON
+        else:
+            raise ValueError(f"Unknown format for file: {filename}")
+        
     @staticmethod
     def type_from_format_name(filename: str) -> StorableType:
         if filename.endswith("_pool.json"):
