@@ -8,14 +8,14 @@ from transformers import AutoTokenizer
 import pathlib
 
 def main() -> int | None:
-    warnings.filterwarnings("ignore", category=ExperimentalWarning)
+    warnings.filterwarnings('ignore', category=ExperimentalWarning)
 
     with DataDatabase(pathlib.Path.cwd().parent) as db:
         db.try_restore()
         # db.recollect_stored()
     with DataDatabase(pathlib.Path.cwd().parent) as db:
-        ag_news = db.get_dataset(DatasetID("ag_news"))
-        sst_2 = db.get_dataset(DatasetID("glue", "sst2"), text_field="sentence")
+        ag_news = db.get_dataset(DatasetID('ag_news'))
+        sst_2 = db.get_dataset(DatasetID('glue', 'sst2'), text_field='sentence')
         experiments = Experiments.from_experiments(
             Experiments.from_product(
                 database=db,
@@ -36,8 +36,8 @@ def main() -> int | None:
         )
 
         experiments.run_all(
-            AutoTokenizer.from_pretrained("google/bert_uncased_L-2_H-128_A-2"),
-            "google/bert_uncased_L-2_H-128_A-2",
+            AutoTokenizer.from_pretrained('google/bert_uncased_L-2_H-128_A-2'),
+            'google/bert_uncased_L-2_H-128_A-2',
             5,
             db,
         )
@@ -45,5 +45,5 @@ def main() -> int | None:
         
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

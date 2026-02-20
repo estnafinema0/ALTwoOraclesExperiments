@@ -13,7 +13,7 @@ import pathlib
 import weakref
 import json
 
-DATA_DIR = pathlib.Path("data")
+DATA_DIR = pathlib.Path('data')
 
 ID = str
 Hash = str
@@ -42,7 +42,7 @@ class StorableEntry:
 
     @staticmethod
     def from_npy(arr: npt.NDArray) -> Self:
-        return StorableEntry(payload={"array": arr}, type=StorableType.ARRAY)
+        return StorableEntry(payload={'array': arr}, type=StorableType.ARRAY)
 
     def get_references(self) -> set[ID]:
         match self.type:
@@ -54,17 +54,17 @@ class StorableEntry:
             ):
                 return set()
             case StorableType.LLM_LABELS:
-                return {self.payload["labels"]}
+                return {self.payload['labels']}
             case StorableType.POOL:
-                return {self.payload["dataset_id"], self.payload["indices"]}
+                return {self.payload['dataset_id'], self.payload['indices']}
             case StorableType.DATASETS:
-                return set(self.payload["datasets"].values())
+                return set(self.payload['datasets'].values())
             case StorableType.EXPERIMENT:
-                return {self.payload["dataset"], self.payload["pool"]} | set(self.payload["histories"].values())
+                return {self.payload['dataset'], self.payload['pool']} | set(self.payload['histories'].values())
             case StorableType.EXPERIMENTS:
-                return set(self.payload["experiments"])
+                return set(self.payload['experiments'])
             case _:
-                assert False, "unreachable"
+                assert False, 'unreachable'
 
 
 @dataclasses.dataclass(slots=True, eq=True)
@@ -88,16 +88,16 @@ class Storable(ABC):  # TODO: from storable
     @staticmethod
     @abstractmethod
     def from_storable(
-        entry: StorableEntry, data: "database.DataDatabase", storable_type: StorableType | None = None
+        entry: StorableEntry, data: 'database.DataDatabase', storable_type: StorableType | None = None
     ) -> Self:
         pass
 
     @classmethod
     def restore(
-        cls, entry: StorableEntry, data: "database.DataDatabase", storable_type: StorableType | None = None
-    ) -> "Storable":
+        cls, entry: StorableEntry, data: 'database.DataDatabase', storable_type: StorableType | None = None
+    ) -> 'Storable':
         if entry.type not in cls.storable_reverse:
-            raise ValueError(f"Unknown stored type, unregistered: {entry.type}")
+            raise ValueError(f'Unknown stored type, unregistered: {entry.type}')
         return cls.storable_reverse[entry.type](entry, data, storable_type=storable_type)
 
     @abstractmethod
@@ -120,20 +120,20 @@ class Storable(ABC):  # TODO: from storable
 
     @staticmethod
     def combine_hashes(*hashes: Hash) -> Hash:
-        return Storable.hash_str("".join(hashes))
+        return Storable.hash_str(''.join(hashes))
 
     @classmethod
-    def register(cls, index: StorableType, storable: "Storable"):
+    def register(cls, index: StorableType, storable: 'Storable'):
         assert index not in cls.storable_reverse
         cls.storable_reverse[index] = storable.from_storable
         cls.storable_classes[index] = storable
 
     @classmethod
     def storable_factory(
-        cls, database: "database.DataDatabase", storable_type: StorableType, *args, **kwargs
-    ) -> "Storable":
+        cls, database: 'database.DataDatabase', storable_type: StorableType, *args, **kwargs
+    ) -> 'Storable':
         if storable_type not in cls.storable_reverse:
-            raise ValueError(f"Unkown stored type, unregistered: {storable_type}")
+            raise ValueError(f'Unkown stored type, unregistered: {storable_type}')
         obj = cls.storable_classes[storable_type](*args, **kwargs)
         obj_id = obj.get_id()
         if obj_id not in database:
@@ -142,7 +142,7 @@ class Storable(ABC):  # TODO: from storable
         return database.retrieve(obj_id)
 
     @classmethod
-    def make_storable[T](cls, index: StorableType) -> "Callable[[type[T]], type[T]]":
+    def make_storable[T](cls, index: StorableType) -> 'Callable[[type[T]], type[T]]':
         def _store(storable: type[T]) -> type[T]:
             cls.register(index, storable)
             return storable
@@ -151,7 +151,7 @@ class Storable(ABC):  # TODO: from storable
 
 
 class Stringifiable(ABC):
-    stringifiebles: "list[Stringifiable]" = []
+    stringifiebles: 'list[Stringifiable]' = []
 
     @abstractmethod
     def __str__(self) -> str:
@@ -163,18 +163,18 @@ class Stringifiable(ABC):
         pass
 
     @staticmethod
-    def restore(s: str) -> "Stringifiable":
+    def restore(s: str) -> 'Stringifiable':
         if s not in Stringifiable.stringifiebles:
-            raise ValueError(f"Unkown stringifiable, unregistered: {s}")
+            raise ValueError(f'Unkown stringifiable, unregistered: {s}')
         for cls in Stringifiable.stringifiebles[s]:
             try:
                 return cls.from_str(s)
             except ValueError:
                 continue
-        raise ValueError(f"Unkown stringifiable, no class could parse: {s}")
+        raise ValueError(f'Unkown stringifiable, no class could parse: {s}')
 
     @classmethod
-    def make_stringifiable[T](cls) -> "Callable[[type[T]], type[T]]":
+    def make_stringifiable[T](cls) -> 'Callable[[type[T]], type[T]]':
         def _store(storable: type[T]) -> type[T]:
             cls.register(storable)
             return storable
@@ -182,9 +182,9 @@ class Stringifiable(ABC):
         return _store
 
     @classmethod
-    def register(cls, storable: "Stringifiable"):
+    def register(cls, storable: 'Stringifiable'):
         if storable in cls.stringifiebles:
-            raise ValueError(f"Stringifiable {storable} already registered")
+            raise ValueError(f'Stringifiable {storable} already registered')
         cls.stringifiebles.append(storable)
 
 
@@ -197,65 +197,65 @@ class Format(enum.Enum):
             case Format.JSON:
                 match entry_type:
                     case StorableType.ARRAY:
-                        raise ValueError("ARRAY type cannot be stored in JSON format")
+                        raise ValueError('ARRAY type cannot be stored in JSON format')
                     case StorableType.POOL:
-                        return f"{id}_pool.json"
+                        return f'{id}_pool.json'
                     case StorableType.SEEDED_INDICES:
-                        return f"{id}_seeded_indices.json"
+                        return f'{id}_seeded_indices.json'
                     case StorableType.LLM_LABELS:
                         assert False  # TODO: implement label storing
                     case StorableType.DATASET:
-                        return f"{id}_dataset.json"
+                        return f'{id}_dataset.json'
                     case StorableType.DATASETS:
-                        return f"{id}_datasets.json"
+                        return f'{id}_datasets.json'
                     case StorableType.EXPERIMENT:
-                        return f"{id}_experiment.json"
+                        return f'{id}_experiment.json'
                     case StorableType.EXPERIMENTS:
-                        return f"{id}_experiments.json"
+                        return f'{id}_experiments.json'
                     case StorableType.EXPERIMENT_HISTORY:
-                        return f"{id}_hist.json"
+                        return f'{id}_hist.json'
                     case _:
-                        raise NotImplementedError(f"JSON format not implemented for {entry_type} type")
+                        raise NotImplementedError(f'JSON format not implemented for {entry_type} type')
             case Format.NPZ:
                 match entry_type:
                     case StorableType.ARRAY:
-                        return f"{id}.npz"
+                        return f'{id}.npz'
                     case _:
-                        raise ValueError(f"{entry_type} type cannot be stored in NPZ format")
+                        raise ValueError(f'{entry_type} type cannot be stored in NPZ format')
             case _:
-                assert False, "unreachable"
+                assert False, 'unreachable'
 
     @staticmethod
     def format_from_format_name(filename: str) -> Self:
-        if filename.endswith(".npz"):
+        if filename.endswith('.npz'):
             return Format.NPZ
-        elif filename.endswith(".json"):
+        elif filename.endswith('.json'):
             return Format.JSON
         else:
-            raise ValueError(f"Unknown format for file: {filename}")
+            raise ValueError(f'Unknown format for file: {filename}')
         
     @staticmethod
     def type_from_format_name(filename: str) -> StorableType:
-        if filename.endswith("_pool.json"):
+        if filename.endswith('_pool.json'):
             return StorableType.POOL
-        elif filename.endswith("_seeded_indices.json"):
+        elif filename.endswith('_seeded_indices.json'):
             return StorableType.SEEDED_INDICES
-        elif filename.endswith("_dataset.json"):
+        elif filename.endswith('_dataset.json'):
             return StorableType.DATASET
-        elif filename.endswith("_datasets.json"):
+        elif filename.endswith('_datasets.json'):
             return StorableType.DATASETS
-        elif filename.endswith("_experiment.json"):
+        elif filename.endswith('_experiment.json'):
             return StorableType.EXPERIMENT
-        elif filename.endswith("_experiments.json"):
+        elif filename.endswith('_experiments.json'):
             return StorableType.EXPERIMENTS
-        elif filename.endswith("_hist.json"):
+        elif filename.endswith('_hist.json'):
             return StorableType.EXPERIMENT_HISTORY
-        elif filename.endswith(".npz"):
+        elif filename.endswith('.npz'):
             return StorableType.ARRAY
         else:
-            raise ValueError(f"Unknown format for file: {filename}")
+            raise ValueError(f'Unknown format for file: {filename}')
 
-    def switch_format(self, new_entry_type: StorableType) -> "Format":
+    def switch_format(self, new_entry_type: StorableType) -> 'Format':
         match self:
             case Format.JSON:
                 match new_entry_type:
@@ -273,11 +273,11 @@ class Format(enum.Enum):
                     ):
                         return Format.JSON
                     case _:
-                        raise NotImplementedError(f"JSON format not implemented for {new_entry_type} type")
+                        raise NotImplementedError(f'JSON format not implemented for {new_entry_type} type')
             case Format.NPZ:
-                raise ValueError(f"{new_entry_type} type cannot be stored in NPZ format")
+                raise ValueError(f'{new_entry_type} type cannot be stored in NPZ format')
             case _:
-                assert False, "unreachable"
+                assert False, 'unreachable'
 
 
 @dataclasses.dataclass(slots=True)
@@ -297,18 +297,18 @@ class Formatter:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         match format:
             case Format.NPZ:
-                np.savez_compressed(filepath, obj.payload["array"])
+                np.savez_compressed(filepath, obj.payload['array'])
             case Format.JSON:
                 json.dump(
                     {
-                        "payload": obj.payload,
-                        "type": obj.type.value,
-                        "id": obj.id,
+                        'payload': obj.payload,
+                        'type': obj.type.value,
+                        'id': obj.id,
                     },
-                    filepath.open("w"),
+                    filepath.open('w'),
                 )
             case _:
-                assert False, "unreachable"
+                assert False, 'unreachable'
 
     @staticmethod
     def load(format: Format, filepath: pathlib.Path) -> StorableEntry:
@@ -316,16 +316,16 @@ class Formatter:
         match format:
             case Format.NPZ:
                 return StorableEntry(
-                    payload={"array": np.load(filepath)},
+                    payload={'array': np.load(filepath)},
                     type=StorableType.ARRAY,
                 )
             case Format.JSON:
-                with filepath.open("r") as f:
+                with filepath.open('r') as f:
                     content = json.load(f)
                 return StorableEntry(
-                    payload=content["payload"],
-                    type=StorableType(content["type"]),
-                    id=content["id"],
+                    payload=content['payload'],
+                    type=StorableType(content['type']),
+                    id=content['id'],
                 )
             case _:
-                assert False, "unreachable"
+                assert False, 'unreachable'

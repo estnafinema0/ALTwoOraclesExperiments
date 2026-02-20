@@ -26,7 +26,7 @@ import re
 
 
 def evaluate_on_test(
-    active_learner: "PoolBasedActiveLearner", test_dataset: "TransformersDataset"
+    active_learner: 'PoolBasedActiveLearner', test_dataset: 'TransformersDataset'
 ) -> tuple[float, float]:
     from sklearn.metrics import accuracy_score, f1_score
 
@@ -34,7 +34,7 @@ def evaluate_on_test(
     y_true = test_dataset.y
 
     acc = accuracy_score(y_true, y_pred)
-    macro_f1 = f1_score(y_true, y_pred, average="macro")
+    macro_f1 = f1_score(y_true, y_pred, average='macro')
     return acc, macro_f1
 
 
@@ -54,10 +54,10 @@ class QueryStrategyType(Stringifiable):
     @abstractmethod
     def run_loop(
         self,
-        pool: "database.Pool",
-        active_learner: "PoolBasedActiveLearner",
+        pool: 'database.Pool',
+        active_learner: 'PoolBasedActiveLearner',
         indices_labeled: npt.NDArray[np.int64],
-        test_dataset: "TransformersDataset",
+        test_dataset: 'TransformersDataset',
         n_iterations: int,
         batch_size: int,
     ) -> tuple[float, float, datetime.timedelta, npt.NDArray[np.int64]]:
@@ -74,17 +74,17 @@ class QueryStrategyType(Stringifiable):
 
     @staticmethod
     @abstractmethod
-    def from_str(s: str) -> "QueryStrategyType":
+    def from_str(s: str) -> 'QueryStrategyType':
         pass
 
     @classmethod
-    def factory_from_str(cls, s: str) -> "QueryStrategyType":
+    def factory_from_str(cls, s: str) -> 'QueryStrategyType':
         for subclass in cls.__get_all_subclasses():
             try:
                 return subclass.from_str(s)
             except ValueError:
                 continue
-        raise ValueError(f"Unknown QueryStrategyType string: {s}")
+        raise ValueError(f'Unknown QueryStrategyType string: {s}')
 
     @abstractmethod
     def __eq__(self, other: object) -> bool:
@@ -120,23 +120,23 @@ class SimpleQueryStrategyType(Stringifiable, enum.StrEnum, metaclass=EnumABCMeta
         return self.value
 
     @classmethod
-    def from_str(cls: "SimpleQueryStrategyType", strategy_str: str) -> "SimpleQueryStrategyType":
+    def from_str(cls: 'SimpleQueryStrategyType', strategy_str: str) -> 'SimpleQueryStrategyType':
         if strategy_str not in SimpleQueryStrategyType:
-            raise ValueError(f"Unknown SimpleQueryStrategyType string: {strategy_str}")
+            raise ValueError(f'Unknown SimpleQueryStrategyType string: {strategy_str}')
         return SimpleQueryStrategyType(strategy_str)
 
     def to_query_strategy(self, num_classes: int) -> QueryStrategy:
         return SimpleQueryStrategyType.__make_query_strategy_instance(self, num_classes)
 
     @classmethod
-    def from_query_strategy(cls: "SimpleQueryStrategyType", strategy: QueryStrategy) -> "SimpleQueryStrategyType":
+    def from_query_strategy(cls: 'SimpleQueryStrategyType', strategy: QueryStrategy) -> 'SimpleQueryStrategyType':
         for key, val in cls.reverse_query_strategy_class_mappings().items():
             if isinstance(strategy, key):
                 return val
-        raise ValueError("Unknown QueryStrategy class")
+        raise ValueError('Unknown QueryStrategy class')
 
     @staticmethod
-    def __make_query_strategy_instance(strategy: "SimpleQueryStrategyType", num_classes: int) -> QueryStrategy:
+    def __make_query_strategy_instance(strategy: 'SimpleQueryStrategyType', num_classes: int) -> QueryStrategy:
         if strategy == SimpleQueryStrategyType.BALD:
             return st_BALD(dropout_samples=10)
         elif strategy == SimpleQueryStrategyType.BADGE:
@@ -162,10 +162,10 @@ class QueryStrategySimple(QueryStrategyType, Stringifiable):
 
     def run_loop(
         self,
-        pool: "database.Pool",
-        active_learner: "PoolBasedActiveLearner",
+        pool: 'database.Pool',
+        active_learner: 'PoolBasedActiveLearner',
         indices_labeled: npt.NDArray[np.int64],
-        test_dataset: "TransformersDataset",
+        test_dataset: 'TransformersDataset',
         n_iterations: int,
         batch_size: int,
     ) -> tuple[float, float, datetime.timedelta, npt.NDArray[np.int64]]:
@@ -186,7 +186,7 @@ class QueryStrategySimple(QueryStrategyType, Stringifiable):
         return str(self.__strategy)
 
     @staticmethod
-    def from_str(s: str) -> "QueryStrategySimple":
+    def from_str(s: str) -> 'QueryStrategySimple':
         return QueryStrategySimple(SimpleQueryStrategyType.from_str(s))
 
     def __eq__(self, other: object) -> bool:
@@ -202,17 +202,17 @@ class MockQueryStrategyType(QueryStrategyType, Stringifiable):
         return {}
 
     def query_strategy_name(self) -> str:
-        return "mock"
+        return 'mock'
 
     def query_strategy_class(self) -> QueryStrategy:
-        raise NotImplementedError("MockQueryStrategyType does not implement query_strategy_class")
+        raise NotImplementedError('MockQueryStrategyType does not implement query_strategy_class')
 
     def run_loop(
         self,
-        pool: "database.Pool",
-        active_learner: "PoolBasedActiveLearner",
+        pool: 'database.Pool',
+        active_learner: 'PoolBasedActiveLearner',
         indices_labeled: npt.NDArray[np.int64],
-        test_dataset: "TransformersDataset",
+        test_dataset: 'TransformersDataset',
         n_iterations: int,
         batch_size: int,
     ) -> tuple[float, float, datetime.timedelta, npt.NDArray[np.int64]]:
@@ -223,19 +223,19 @@ class MockQueryStrategyType(QueryStrategyType, Stringifiable):
         return acc, macro_f1, duration, indices_labeled
 
     def __str__(self) -> str:
-        return "mock"
+        return 'mock'
 
     @staticmethod
-    def from_str(s: str) -> "MockQueryStrategyType":
-        if s != "mock":
-            raise ValueError("Invalid string for MockQueryStrategyType")
+    def from_str(s: str) -> 'MockQueryStrategyType':
+        if s != 'mock':
+            raise ValueError('Invalid string for MockQueryStrategyType')
         return MockQueryStrategyType()
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, MockQueryStrategyType)
 
     def __hash__(self) -> int:
-        return hash("mock")
+        return hash('mock')
 
 
 @Stringifiable.make_stringifiable()
@@ -244,7 +244,7 @@ class ColdStartStrategy(Stringifiable):
     query_strategy: QueryStrategyType
     batch_size: int  # Размер выборки для обучения на одной итерации
 
-    STR_PATTERN = re.compile(r"(?P<query_strategy>\w+)_(?P<budget>\d+)_(?P<batch_size>\d+)")
+    STR_PATTERN = re.compile(r'(?P<query_strategy>\w+)_(?P<budget>\d+)_(?P<batch_size>\d+)')
 
     @property  # TODO: make multiple iterations possible
     def budget(self) -> int:
@@ -255,25 +255,25 @@ class ColdStartStrategy(Stringifiable):
         return 1
 
     def __str__(self) -> str:
-        return f"{self.query_strategy.query_strategy_name()}_{self.budget}_{self.batch_size}"
+        return f'{self.query_strategy.query_strategy_name()}_{self.budget}_{self.batch_size}'
 
     @staticmethod
-    def from_str(strategy_str: str) -> "ColdStartStrategy":
+    def from_str(strategy_str: str) -> 'ColdStartStrategy':
         m = re.fullmatch(ColdStartStrategy.STR_PATTERN, strategy_str)
         if m is None:
-            raise ValueError("Invalid ColdStartStrategy string representation")
-        query_strategy_str = m.group("query_strategy")
-        budget = int(m.group("budget"))
-        batch_size = int(m.group("batch_size"))
+            raise ValueError('Invalid ColdStartStrategy string representation')
+        query_strategy_str = m.group('query_strategy')
+        budget = int(m.group('budget'))
+        batch_size = int(m.group('batch_size'))
         if budget != batch_size:
-            raise ValueError("Inconsistent budget and batch_size for ColdStartStrategy")
+            raise ValueError('Inconsistent budget and batch_size for ColdStartStrategy')
         return ColdStartStrategy(
             query_strategy=QueryStrategyType.factory_from_str(query_strategy_str),
             batch_size=batch_size,
         )
 
     @staticmethod
-    def from_budget(query_strategy: QueryStrategyType, budget: int) -> "ColdStartStrategy":
+    def from_budget(query_strategy: QueryStrategyType, budget: int) -> 'ColdStartStrategy':
         return ColdStartStrategy(query_strategy=query_strategy, batch_size=budget)
 
     def __eq__(self, other: object) -> bool:
@@ -289,7 +289,7 @@ class ColdStartStrategy(Stringifiable):
         return hash((self.query_strategy.query_strategy_name(), self.batch_size, self.budget))
 
     def __repr__(self) -> str:
-        return f"ColdStartStrategy(query_strategy={self.query_strategy}, batch_size={self.batch_size}, budget={self.budget}, n_iterations={self.n_iterations})"
+        return f'ColdStartStrategy(query_strategy={self.query_strategy}, batch_size={self.batch_size}, budget={self.budget}, n_iterations={self.n_iterations})'
 
 
 @Stringifiable.make_stringifiable()
@@ -304,25 +304,25 @@ class ActiveLearningStrategy(Stringifiable):
         self.batch_size = batch_size
         self.budget = budget
 
-    STR_PATTERN = re.compile(r"(?P<query_strategy>\w+)_(?P<batch_size>\d+)_(?P<budget>\d+)")
+    STR_PATTERN = re.compile(r'(?P<query_strategy>\w+)_(?P<batch_size>\d+)_(?P<budget>\d+)')
 
     @property
     def n_iterations(self) -> int:
         return self.budget // self.batch_size + (1 if self.budget % self.batch_size > 0 else 0)
 
     def __str__(self) -> str:
-        return f"{self.query_strategy.query_strategy_name()}_{self.batch_size}_{self.budget}"
+        return f'{self.query_strategy.query_strategy_name()}_{self.batch_size}_{self.budget}'
 
     @staticmethod
-    def from_str(strategy_str: str) -> "ActiveLearningStrategy":
+    def from_str(strategy_str: str) -> 'ActiveLearningStrategy':
         m = re.fullmatch(ActiveLearningStrategy.STR_PATTERN, strategy_str)
         if m is None:
-            raise ValueError("Invalid ActiveLearningStrategy string representation")
-        query_strategy_str = m.group("query_strategy")
-        batch_size = int(m.group("batch_size"))
-        budget = int(m.group("budget"))
+            raise ValueError('Invalid ActiveLearningStrategy string representation')
+        query_strategy_str = m.group('query_strategy')
+        batch_size = int(m.group('batch_size'))
+        budget = int(m.group('budget'))
         if budget != batch_size * (budget // batch_size) + (budget % batch_size):
-            raise ValueError("Inconsistent budget and batch_size for ActiveLearningStrategy")
+            raise ValueError('Inconsistent budget and batch_size for ActiveLearningStrategy')
         return ActiveLearningStrategy(
             query_strategy=QueryStrategyType.factory_from_str(query_strategy_str),
             batch_size=batch_size,
@@ -331,14 +331,14 @@ class ActiveLearningStrategy(Stringifiable):
 
     def batch_size_at(self, iteration: int) -> int:
         if iteration < 0 or iteration >= self.n_iterations:
-            raise ValueError("Invalid iteration number")
+            raise ValueError('Invalid iteration number')
         if iteration < self.n_iterations - 1:
             return self.batch_size
         else:
             return self.budget - self.batch_size * (self.n_iterations - 1)
 
     def __repr__(self):
-        return f"ActiveLearningStrategy(query_strategy={self.query_strategy}, batch_size={self.batch_size}, budget={self.budget}, n_iterations={self.n_iterations})"
+        return f'ActiveLearningStrategy(query_strategy={self.query_strategy}, batch_size={self.batch_size}, budget={self.budget}, n_iterations={self.n_iterations})'
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, ActiveLearningStrategy):
@@ -381,9 +381,9 @@ class ComposeStrategyWrapper(QueryStrategy):
         else:
             strategy = self.active_learning_strategy
         if remaining_cs_budget > 0 and n > remaining_cs_budget:
-            raise ValueError("Requested more samples than available in cold start pool")
+            raise ValueError('Requested more samples than available in cold start pool')
         self.__budget_used += n
         return strategy.query(clf, dataset, indices_unlabeled, indices_labeled, y, n=n)
 
     def __repr__(self):
-        return f"ComposeStrategyWrapper(phase={'\"Cold start\"' if self.__budget_used < self.cs_strategy.budget else '\"Active learning\"'}, budget_used={self.__budget_used}, al_strategy={self.al_strategy}, cs_strategy={self.cs_strategy}, num_classes={self.num_classes})"
+        return f'ComposeStrategyWrapper(phase={'"Cold start"' if self.__budget_used < self.cs_strategy.budget else '"Active learning"'}, budget_used={self.__budget_used}, al_strategy={self.al_strategy}, cs_strategy={self.cs_strategy}, num_classes={self.num_classes})'
