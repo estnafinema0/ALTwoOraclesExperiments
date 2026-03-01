@@ -4,7 +4,6 @@ import numpy as np
 import numpy.typing as npt
 
 import dataclasses
-import functools
 import enum
 from abc import ABC, abstractmethod
 from typing import Self, Callable
@@ -41,15 +40,15 @@ class StorableEntry:
     id: ID
 
     @staticmethod
-    def from_npy(arr: npt.NDArray) -> Self:
-        return StorableEntry(payload={'array': arr}, type=StorableType.ARRAY)
+    def from_npy(arr: npt.NDArray, id: ID) -> Self:
+        return StorableEntry(payload={'array': arr}, type=StorableType.ARRAY, id=id)
 
     def get_references(self) -> set[ID]:
         match self.type:
             case t if t in (
                 StorableType.ARRAY,
-                StorableType.SEEDED_INDICES,
                 StorableType.DATASET,
+                StorableType.SEEDED_INDICES,
                 StorableType.EXPERIMENT_HISTORY,
             ):
                 return set()
@@ -233,7 +232,7 @@ class Format(enum.Enum):
             return Format.JSON
         else:
             raise ValueError(f'Unknown format for file: {filename}')
-        
+
     @staticmethod
     def type_from_format_name(filename: str) -> StorableType:
         if filename.endswith('_pool.json'):
@@ -318,6 +317,7 @@ class Formatter:
                 return StorableEntry(
                     payload={'array': np.load(filepath)},
                     type=StorableType.ARRAY,
+                    id='',
                 )
             case Format.JSON:
                 with filepath.open('r') as f:

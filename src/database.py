@@ -1,23 +1,19 @@
-from utils import EnumABCMeta, open_subbuild
+from utils import EnumABCMeta
 import storage
 import experiments
-from transformers.models.bert.tokenization_bert_fast import BertTokenizerFast
+from transformers.models.bert import BertTokenizerFast
 from small_text.integrations.transformers.datasets import TransformersDataset
 import datasets
 import numpy as np
 import numpy.typing as npt
 
-import itertools
-import hashlib
 import re
 import dataclasses
 import pathlib
 import functools
 import enum
 import json
-import uuid
-import contextlib
-from typing import Iterable, Self, Protocol
+from typing import Iterable
 
 
 class Indices(storage.Storable):
@@ -167,7 +163,7 @@ class LLMLabels(storage.Storable):  # TODO: consider pool mapping
         )
 
 
-class Dataset(Protocol):
+class Dataset:
     def __init__(self, dataset: datasets.Dataset, base: 'CompleteDataset'):
         self.dataset = dataset
         self.base = base
@@ -194,6 +190,7 @@ class Dataset(Protocol):
     def __len__(self) -> int:
         return self.size
 
+    @functools.cache
     def to_transformers_dataset(
         self, tokenizer: BertTokenizerFast, num_classes: int, max_length: int = 128
     ) -> TransformersDataset:
@@ -204,6 +201,43 @@ class Dataset(Protocol):
             target_labels=np.arange(num_classes, dtype=np.int64),
             max_length=max_length,
         )
+
+
+class LazyTrainDataset:
+    def __init__(self, base: 'CompleteDataset'):
+        self.base = base
+        # self.annotations = ...
+        self.__dataset = None
+
+    @property
+    def __internal_dataset(self) -> Dataset:
+        if self.__dataset is None:
+            self.__dataset = self.base.train
+        return self.__dataset
+
+    @property
+    def dataset(self) -> datasets.Dataset:
+        return self.__internal_dataset.dataset
+
+    @property
+    def y(self) -> npt.NDArray[np.int64]:
+        return self.__internal_dataset.y
+
+    @property
+    def x(self) -> npt.NDArray[np.str_]:
+        return self.__internal_dataset.x
+
+    @property
+    def size(self) -> int:
+        return self.__internal_dataset.size
+
+    def __len__(self) -> int:
+        return len(self.__internal_dataset)
+
+    def to_transformers_dataset(
+        self, tokenizer: BertTokenizerFast, num_classes: int, max_length: int = 128
+    ) -> TransformersDataset:
+        return self.__internal_dataset.to_transformers_dataset(tokenizer, num_classes, max_length)
 
 
 @storage.Storable.make_storable(storage.StorableType.POOL)
@@ -278,9 +312,10 @@ class Pool(storage.Storable):
         payload = entry.payload
         return Pool(
             indices=data.retrieve(payload['indices']),
-            dataset=data.retrieve(payload['dataset_id']).train,
+            dataset=data.retrieve(payload['dataset_id']).lazy_train,
         )
 
+    @functools.cache
     def to_transformers_dataset(
         self, tokenizer: BertTokenizerFast, num_classes: int, max_length: int = 128
     ) -> TransformersDataset:
@@ -311,7 +346,9 @@ class Pool(storage.Storable):
 
 @storage.Storable.make_storable(storage.StorableType.DATASET)
 class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
-    def __init__(self, id: DatasetID, text_field: str, label_field: str, database: 'DataDatabase'):
+    def __init__(
+        self, id: DatasetID, text_field: str, label_field: str, database: 'DataDatabase', train_len: None | int = None
+    ):
         self.id = id
         self.text_field = text_field
         self.label_field = label_field
@@ -320,6 +357,7 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
         self.__train = None
         self.__validation = None
         self.__database = database
+        self.__train_len = train_len
 
     @property
     def annotations(self) -> dict[LLMType, LLMLabels]:  # TODO: pass storage object
@@ -346,6 +384,16 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
         return self.__train
 
     @property
+    def lazy_train(self) -> LazyTrainDataset:
+        return LazyTrainDataset(self)
+
+    @property
+    def len_train(self):
+        if self.__train_len is None:
+            self.__train_len = len(self.train)
+        return self.__train_len
+
+    @property
     def validation(self) -> Dataset:
         if self.__validation is None:
             self.__validation = Dataset(self.internal.get('validation', self.internal['test']), self)
@@ -366,7 +414,7 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
         id = Pool.make_id(self.id, indices.get_id())
         if id in self.__database:
             return self.__database.retrieve(id)
-        obj = Pool(indices, self.train)
+        obj = Pool(indices, self.lazy_train)
         self.__database.encache(obj)
         return obj
 
@@ -390,6 +438,7 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
                         'text_field': self.text_field,
                         'label_field': self.label_field,
                         'dataset': str(self.id),
+                        'train_len': self.len_train,
                     },
                     type=storage.StorableType.DATASET,
                     id=self.get_id(),
@@ -409,6 +458,7 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
             text_field=payload['text_field'],
             label_field=payload['label_field'],
             database=data,
+            train_len=payload['train_len'],
         )
         data.encache(obj)
         return obj
@@ -475,6 +525,7 @@ class Datasets(storage.Storable):
                         },
                     },
                     type=storage.StorableType.DATASETS,
+                    id=self.get_id(),
                 ),
                 **dict(item for d in self.datasets.values() for item in d.as_storable().entries.items()),
             },
@@ -547,7 +598,9 @@ class DataDatabase:
     def add_to_store_index(self, obj: storage.StorableBundle | storage.StorableEntry, *, force: bool = False):
         if isinstance(obj, storage.StorableEntry):
             if force or obj.id not in self.stored_index:
-                self.stored_index[obj.id] = storage.StoredEntry(obj, stored=False, format=None)
+                self.stored_index[obj.id] = storage.StoredEntry(
+                    obj, stored=False, format=None if obj.type != storage.StorableType.ARRAY else storage.Format.NPZ
+                )
             return
         if isinstance(obj, storage.StorableBundle):
             self.__add_to_store_index_rec(obj.main, obj, force=force)
@@ -716,11 +769,10 @@ class DataDatabase:
                             if len(current_entry.payload['histories']) > len(loaded_entry.obj.payload['histories'])
                             else loaded_entry.obj
                         )
+                        print(f'diff: {current_entry.payload['histories']} -- {loaded_entry.obj.payload['histories']}')
                     del self.stored_index[id]
                     if entry.obj.type == storage.StorableType.EXPERIMENT:
                         key = experiments.Experiments.ExperimentKey.from_experiment(self.objects_store[id])
-                        print(key)
-                        print(key in self.experiments)
                         del self.experiments[key]
 
                     if entry.obj.type == storage.StorableType.DATASET:
@@ -824,7 +876,7 @@ class DataDatabase:
                                     )
                                     del self.experiments[key]
                                     del self.objects_store[stored_id]
-                                self.add_to_store_index(obj.as_storable())
+                                self.add_to_store_index(obj)
 
     def get_dataset(self, obj: DatasetID, text_field: str = 'text', label_field: str = 'label') -> CompleteDataset:
         if obj in self.datasets:

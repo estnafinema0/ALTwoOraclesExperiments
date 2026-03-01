@@ -13,13 +13,13 @@ from small_text.integrations.pytorch.query_strategies import BADGE as st_BADGE
 from small_text.query_strategies.bayesian import BALD as st_BALD
 import numpy as np
 import numpy.typing as npt
+import torch
 
 import enum
 from typing import Self
-import datasets
 import dataclasses
 import datetime
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import time
 import itertools
 import re
@@ -71,6 +71,9 @@ class QueryStrategyType(Stringifiable):
 
     def __str__(self) -> str:
         return self.query_strategy_name()
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}({self.__str__()})'
 
     @staticmethod
     @abstractmethod
@@ -380,6 +383,20 @@ class ComposeStrategyWrapper(QueryStrategy):
             strategy = self.cold_start_strategy
         else:
             strategy = self.active_learning_strategy
+
+            if self.__budget_used == self.cs_strategy.budget:
+                print(f'[INFO]: {self.al_strategy.batch_size}/{self.al_strategy.budget}', flush=True, end='')
+            elif self.__budget_used - self.cs_strategy.budget + self.al_strategy.batch_size != self.al_strategy.budget:
+                print(
+                    f', {self.__budget_used - self.cs_strategy.budget + self.al_strategy.batch_size}/{self.al_strategy.budget}',
+                    flush=True,
+                    end='',
+                )
+            else:
+                print(
+                    f', {self.__budget_used - self.cs_strategy.budget + self.al_strategy.batch_size}/{self.al_strategy.budget}',
+                    flush=True,
+                )
         if remaining_cs_budget > 0 and n > remaining_cs_budget:
             raise ValueError('Requested more samples than available in cold start pool')
         self.__budget_used += n

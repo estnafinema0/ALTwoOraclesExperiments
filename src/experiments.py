@@ -6,21 +6,21 @@ if TYPE_CHECKING:
 import strategies
 import database
 from storage import Storable, StorableBundle, StorableEntry, StorableType, ID, Hash, Format
+from utils import carried_partial_apply
 
 from small_text import (
     TransformerModelArguments,
     TransformerBasedClassificationFactory,
-    random_initialization_balanced,
 )
 import numpy as np
-import datetime
 
+import datetime
 import uuid
 import builtins
 import dataclasses
 import itertools
 import functools
-from typing import Self, Optional, Never
+from typing import Self, Optional, Callable, Iterable
 
 
 @Storable.make_storable(StorableType.EXPERIMENT_HISTORY)
@@ -52,8 +52,8 @@ class ExperimentHistory(Storable):
     def _get_salt(
         dataset_id: 'database.DatasetID',
         seed: int,
-        cs_strategy: strategies.QueryStrategyType,
-        al_strategy: strategies.QueryStrategyType,
+        cs_strategy: strategies.ColdStartStrategy,
+        al_strategy: strategies.ActiveLearningStrategy,
     ) -> Hash:
         return Storable.combine_hashes(
             *map(
@@ -129,15 +129,15 @@ class ExperimentHistory(Storable):
 def make_classifier_factory(
     transformer_model_name: str, num_classes: int, train_batch_size: int, num_epochs: int = 3
 ) -> TransformerBasedClassificationFactory:
-    model_args = TransformerModelArguments(transformer_model_name)
-
     import torch
+
+    model_args = TransformerModelArguments(transformer_model_name)
 
     clf_factory = TransformerBasedClassificationFactory(
         model_args,
         num_classes,
-        kwargs=dict(
-            device='cuda' if torch.cuda.is_available() else 'cpu',
+        classification_kwargs=dict(
+            device='cpu',  # "mps" if torch.mps.is_available() else "cpu",
             num_epochs=num_epochs,
             mini_batch_size=train_batch_size,
         ),
@@ -162,15 +162,19 @@ class Experiment(Storable):
 
     @property
     def budget(self) -> int:
-        return self.cold_start_strategy.budget + self.active_learning_strategy.budget + 2  # +2 for dirty hack
+        return self.cold_start_strategy.budget + self.active_learning_strategy.budget  # + 2  # +2 for dirty hack
 
     @property
     def split(self) -> int:
-        return self.cold_start_strategy.budget + 2  # +2 for dirty hack
+        return self.cold_start_strategy.budget  # + 2  # +2 for dirty hack
 
     @property
     def runs(self) -> int:
         return len(self.histories)
+
+    @property
+    def sorted_histories(self) -> list[ExperimentHistory]:
+        return [h[1] for h in sorted(self.histories.items(), key=lambda p: p[0])[: self.runs]]
 
     @staticmethod
     def _get_salt(
@@ -250,11 +254,14 @@ class Experiment(Storable):
         return f'Experiment(cs={self.cold_start_strategy.__repr__()}, al={self.active_learning_strategy.__repr__()}, seed={self.pool.indices.seed}, runs={self.runs}, dataset={self.dataset.id})'
 
     def run_single(
-        self, tokenizer: 'BertTokenizerFast', fine_tuning_model: str, run_number: int, database: 'database.DataDatabase'
+        self,
+        tokenizer: 'BertTokenizerFast',
+        fine_tuning_model: str,
+        run_number: int,
+        database: 'database.DataDatabase',
     ):
         from small_text import PoolBasedActiveLearner
 
-        print(f'[INFO]: RUNNING EXPERIMENT (run {run_number}): {self}')
         num_classes = len(np.unique(self.dataset.train.y))
         train_dataset = self.pool.to_transformers_dataset(tokenizer, num_classes)
         test_dataset = self.dataset.validation.to_transformers_dataset(tokenizer, num_classes)
@@ -267,16 +274,25 @@ class Experiment(Storable):
             strategies.ComposeStrategyWrapper(self.active_learning_strategy, self.cold_start_strategy, num_classes),
             train_dataset,
         )
-        # TODO: FIX DIRTY HACK
 
-        indices_initial = random_initialization_balanced(train_dataset.y, n_samples=2)
-        y_initial = np.array(train_dataset.y[indices_initial], dtype=np.int64)
-        active_learner.initialize_data(indices_initial, y_initial)
+        clf = active_learner._clf_factory.new()
+        clf.initialize()
+        active_learner.initialize(clf)
 
-        indices_labeled = indices_initial.copy()
+        clf = active_learner._clf
+        orig_embed = getattr(clf, 'embed', None)
+        if callable(orig_embed):
+
+            def embed_adapter(*args, **kwargs):
+                kwargs.pop('pbar', None)
+                return orig_embed(*args, **kwargs)
+
+            clf.embed = embed_adapter
+
+        indices_labeled = np.array([], dtype=np.int64)
 
         # cold start cycle
-        print('Running cold start strategy...')
+        print('[INFO]: Running cold start strategy...')
         acc_cs, macro_f1_cs, duration_cs, indices_labeled = self.cold_start_strategy.query_strategy.run_loop(
             self.pool,
             active_learner,
@@ -287,7 +303,7 @@ class Experiment(Storable):
         )
 
         # active learning cycle
-        print('Running active learning strategy...')
+        print('[INFO]: Running active learning strategy...')
         acc_al, macro_f1_al, duration_al, indices_labeled = self.active_learning_strategy.query_strategy.run_loop(
             self.pool,
             active_learner,
@@ -321,9 +337,17 @@ class Experiment(Storable):
         *,
         repeat: int = 1,
         from_run: int = 1,
+        run_iteration_callback: Callable[[Self, int], None] | None = None,
     ):
         for run in range(from_run, repeat + 1):
-            self.run_single(tokenizer, fine_tuning_model, run, database)
+            if run_iteration_callback is not None:
+                run_iteration_callback(self, run)
+            self.run_single(
+                tokenizer,
+                fine_tuning_model,
+                run,
+                database,
+            )
 
 
 @Storable.make_storable(StorableType.EXPERIMENTS)
@@ -384,6 +408,9 @@ class Experiments(Storable):
                 and self.al_strategy == value.al_strategy
                 and self.al_strategy is not None
             )
+
+        # def set(self, property, value) -> "Experiments.ExperimentKey":
+        #     return dataclasses.replace(self, **{property: value})
 
     @dataclasses.dataclass(eq=True)
     class ExperimentInfo:
@@ -468,6 +495,7 @@ class Experiments(Storable):
         return functools.reduce(lambda acc, exp: acc.merge(exp), experiments, Experiments())
 
     @staticmethod
+    @carried_partial_apply
     def from_product(
         database: 'database.DataDatabase',
         datasets: list['database.CompleteDataset'],
@@ -485,7 +513,7 @@ class Experiments(Storable):
                     dataset=dataset,
                     pool=dataset.pool(
                         Storable.storable_factory(
-                            database, StorableType.SEEDED_INDICES, pool_size, seed, len(dataset.train)
+                            database, StorableType.SEEDED_INDICES, pool_size, seed, dataset.len_train
                         )
                     ),
                     cold_start_strategy=strategies.ColdStartStrategy(cs_strategy_type, batch_size=split),
@@ -512,8 +540,10 @@ class Experiments(Storable):
         database: 'database.DataDatabase',
         *,
         default_force: bool = False,
+        experiment_iteration_callback: Callable[[int, Experiment, ExperimentInfo], None] | None = None,
+        run_iteration_callback: Callable[[Experiment, int], None] | None = None,
     ):
-        for experiment in self.experiments:
+        for i, experiment in enumerate(self.experiments):
             experiment_info = self.__experiments_map[Experiments.ExperimentKey.from_experiment(experiment)][2]
             force = default_force if experiment_info.force is None else experiment_info.force
             exp: Experiment = database.get_experiment(experiment)
@@ -521,8 +551,18 @@ class Experiments(Storable):
                 self.set(exp)
             else:
                 starting_point = exp.runs + 1 if exp.runs > 0 else 1
-                exp.run(tokenizer, fine_tuning_model, database, repeat=runs, from_run=starting_point)
+                if experiment_iteration_callback is not None:
+                    experiment_iteration_callback(i, exp, experiment_info)
+                exp.run(
+                    tokenizer,
+                    fine_tuning_model,
+                    database,
+                    repeat=runs,
+                    from_run=starting_point,
+                    run_iteration_callback=run_iteration_callback,
+                )
                 database.store_fast(exp.as_storable(), Format.JSON)
+                self.set(exp)
 
     def __getitem__(self, key: 'Experiments.ExperimentKey') -> tuple[Experiment, int, 'Experiments.ExperimentInfo']:
         matching = {e for e in self.__experiments_map.keys() if e.equivalent(key)}
@@ -542,9 +582,86 @@ class Experiments(Storable):
         key = matching.pop()
         _, idx, _ = self.__experiments_map[key]
         del self.__experiments_map[key]
+        tmp = tuple(self.__experiments_map.items())
+        for k, (exp, i, info) in tmp:
+            if i > idx:
+                self.__experiments_map[k] = (exp, i - 1, info)
         self.experiments.pop(idx)
 
     def matching(
         self, key: 'Experiments.ExperimentKey'
     ) -> builtins.set[tuple[Experiment, int, 'Experiments.ExperimentInfo']]:
         return {self.__experiments_map[e] for e in self.__experiments_map.keys() if e.equivalent(key)}
+
+    def sort_by(self, *, first: Iterable[str | dict] | None = None, last: Iterable[str | dict] | None = None):
+        if first is None:
+            first = ()
+        if last is None:
+            last = ()
+        VALID_PARAMS = {'dataset', 'seed', 'cold_start_strategy', 'active_learning_strategy', 'budget', 'split'}
+        first = tuple(first)
+        last = tuple(last)
+        first_names = tuple(attr if isinstance(attr, str) else attr['attr'] for attr in first)
+        last_names = tuple(attr if isinstance(attr, str) else attr['attr'] for attr in last)
+        if set(first_names) & set(last_names):
+            raise ValueError(f'Can\'t order both first and last by {set(first) & set(last)}')
+        if len(set(first_names)) != len(first) or len(set(last_names)) != len(last):
+            raise ValueError('Can\'t order by repeating keys')
+        if not all(p in VALID_PARAMS for p in itertools.chain(first_names, last_names)):
+            raise ValueError('Unknown sorting criteria')
+
+        def get_param_key(exp: Experiment, param: str, reverse=False):
+            return reverse_key(*extract_param(exp, param), reverse)
+
+        def extract_param(exp: Experiment, param: str) -> tuple[int, type[int]] | tuple[str, type[str]]:
+            if param == 'dataset':
+                return str(exp.dataset.id), str
+            elif param == 'seed':
+                return exp.pool.indices.seed, int
+            elif param == 'cold_start_strategy':
+                return str(exp.cold_start_strategy.query_strategy), str
+            elif param == 'active_learning_strategy':
+                return str(exp.active_learning_strategy.query_strategy), str
+            elif param == 'budget':
+                return exp.budget, int
+            elif param == 'split':
+                return exp.split, int
+            raise ValueError(f'Unknown parameter: {param}')
+
+        def reverse_key(key: str | int, type: type[str] | type[int], reverse: bool):
+            if not reverse:
+                return key
+            if type is int:
+                return -key
+            elif type is str:
+
+                @functools.total_ordering
+                class ReverseStrKey:
+                    def __init__(self, key: str):
+                        self.key = key
+
+                    def __eq__(self, value: Self):
+                        return self.key == value.key
+
+                    def __lt__(self, value: Self):
+                        return self.key > value.key
+
+                return ReverseStrKey(key)
+            raise ValueError(f'Unknown type: {type}')
+
+        props = last[::-1] + tuple(VALID_PARAMS - set(first_names) - set(last_names)) + first[::-1]
+        key_func = lambda exp: tuple(
+            (
+                get_param_key(exp, param)
+                if isinstance(param, str)
+                else get_param_key(exp, param['attr'], reverse=param.get('reverse', False))
+            )
+            for param in props
+        )
+        self.experiments.sort(key=key_func)
+        for i, exp in enumerate(self.experiments):
+            self.__experiments_map[Experiments.ExperimentKey.from_experiment(exp)] = (
+                exp,
+                i,
+                self.__experiments_map[Experiments.ExperimentKey.from_experiment(exp)][2],
+            )
