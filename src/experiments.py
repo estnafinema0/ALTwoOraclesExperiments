@@ -222,7 +222,7 @@ class Experiment(Storable):
                         'cold_start_strategy': str(self.cold_start_strategy),
                         'active_learning_strategy': str(self.active_learning_strategy),
                         'runs': self.runs,
-                        'histories': {run: history.get_id() for run, history in self.histories.items()},
+                        'histories': {str(run): history.get_id() for run, history in self.histories.items()},
                     },
                     type=StorableType.EXPERIMENT,
                     id=self.get_id(),
@@ -564,7 +564,9 @@ class Experiments(Storable):
                 database.store_fast(exp.as_storable(), Format.JSON)
                 self.set(exp)
 
-    def __getitem__(self, key: 'Experiments.ExperimentKey') -> tuple[Experiment, int, 'Experiments.ExperimentInfo']:
+    def __getitem__(self, key: 'Experiments.ExperimentKey | Experiment') -> tuple[Experiment, int, 'Experiments.ExperimentInfo']:
+        if isinstance(key, Experiment):
+            key = Experiments.ExperimentKey.from_experiment(key)
         matching = {e for e in self.__experiments_map.keys() if e.equivalent(key)}
         if len(matching) != 1:
             raise KeyError(f'Key {key} is ambiguous, matches {len(matching)} experiments')
@@ -575,7 +577,9 @@ class Experiments(Storable):
             key = Experiments.ExperimentKey.from_experiment(key)
         return any(e == key for e in self.__experiments_map.keys())
 
-    def __delitem__(self, key: 'Experiments.ExperimentKey'):
+    def __delitem__(self, key: 'Experiments.ExperimentKey | Experiment'):
+        if isinstance(key, Experiment):
+            key = Experiments.ExperimentKey.from_experiment(key)
         matching = {e for e in self.__experiments_map.keys() if e.equivalent(key)}
         if len(matching) != 1:
             raise KeyError(f'Key {key} is ambiguous, matches {len(matching)} experiments')

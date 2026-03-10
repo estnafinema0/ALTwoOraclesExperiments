@@ -15,38 +15,37 @@ from transformers.utils.logging import disable_progress_bar
 import pathlib
 from types import MethodType
 
+def ensure_interactive_plot_backend():
+    backend_name = str(matplotlib.get_backend())
+    backend_name_lower = backend_name.lower()
+    needs_gui_backend = backend_name_lower == "agg" or "inline" in backend_name_lower
+
+    if not needs_gui_backend:
+        return
+
+    for candidate_backend in ("MacOSX", "QtAgg", "TkAgg"):
+        try:
+            plt.switch_backend(candidate_backend)
+            return
+        except Exception:
+            continue
+
+    print(
+        f"[WARN]: Could not switch matplotlib to a GUI backend (current backend: {backend_name}). "
+        "3D rotation may be unavailable."
+    )
 
 def main() -> int | None:
-    warnings.filterwarnings("ignore", category=ExperimentalWarning)
-    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings('ignore', category=ExperimentalWarning)
+    warnings.filterwarnings('ignore', category=UserWarning)
     disable_progress_bar()
 
-    def ensure_interactive_plot_backend():
-        backend_name = str(matplotlib.get_backend())
-        backend_name_lower = backend_name.lower()
-        needs_gui_backend = backend_name_lower == "agg" or "inline" in backend_name_lower
-
-        if not needs_gui_backend:
-            return
-
-        for candidate_backend in ("MacOSX", "QtAgg", "TkAgg"):
-            try:
-                plt.switch_backend(candidate_backend)
-                return
-            except Exception:
-                continue
-
-        print(
-            f"[WARN]: Could not switch matplotlib to a GUI backend (current backend: {backend_name}). "
-            "3D rotation may be unavailable."
-        )
-
     ensure_interactive_plot_backend()
-
+    
     with DataDatabase(pathlib.Path.cwd().parent) as db:
-        # db.try_restore()
-        ag_news = db.get_dataset(DatasetID("ag_news"))
-        sst_2 = db.get_dataset(DatasetID("glue", "sst2"), text_field="sentence")
+        db.try_restore()
+        ag_news = db.get_dataset(DatasetID('ag_news'))
+        sst_2 = db.get_dataset(DatasetID('glue', 'sst2'), text_field='sentence')
 
         from_product = Experiments.from_product(
             database=db,
@@ -78,10 +77,10 @@ def main() -> int | None:
             # ),
         )
 
-        experiments.sort_by(first=("seed", "dataset"), last=({"attr": "split", "reverse": False},))
+        experiments.sort_by(first=('seed', 'dataset'), last=({'attr': 'split', 'reverse': True},))
 
         tokenizer = AutoTokenizer.from_pretrained(
-            "google/bert_uncased_L-2_H-128_A-2", cache_dir=pathlib.Path("./cache")
+            'google/bert_uncased_L-2_H-128_A-2', cache_dir=pathlib.Path('./cache')
         )
 
         def _encode_plus_adapter(self, text, text_pair=None, **kwargs):
@@ -91,7 +90,7 @@ def main() -> int | None:
 
         tokenizer.encode_plus = MethodType(_encode_plus_adapter, tokenizer)
 
-        runs = 3
+        runs = 5
 
         @dataclasses.dataclass
         class RunningInfo:
@@ -107,20 +106,21 @@ def main() -> int | None:
 
         def log_run(exp: Experiment, run: int):
             print(
-                f"[INFO]: RUNNING EXPERIMENT [{info.at}#{info.order_at}({run})/{info.total}/{len(experiments)}]: {exp}"
+                f'[INFO]: RUNNING EXPERIMENT [{info.at}#{info.order_at}({run})/{info.total}/{len(experiments)}]: {exp}'
             )
 
         experiments.run_all(
             tokenizer,
-            "google/bert_uncased_L-2_H-128_A-2",
+            'google/bert_uncased_L-2_H-128_A-2',
             runs,
             db,
             experiment_iteration_callback=update_info,
             run_iteration_callback=log_run,
         )
 
-        # db.recollect_stored()
+        db.recollect_stored()
 
+        
         rng = ExperimentsRange(
             experiments,
             ExperimentFilter(
@@ -176,19 +176,22 @@ def main() -> int | None:
                 runs=5,
             ),
         )
-
+        
         # print(groups)
-        # print(groups.unique_tuples(("seed", "split")))
+        # print(groups.contained[0].unique_tuples(("seed", "split")))
         printable = groups.to_printable()
-        # print(printable)
         # aggregated = groups.aggregate()
-        # print(groups.contained[0].contained[0].contained[0])
+        # print(printable)
+        # print(groups_for_count.contained[0].aggregate())
+
+        # return
 
         strategies = set()
         datasets = set()
         splits = set()
         data = {}
 
+        
         for strat_key, inner in printable.items():
             strategy_obj = strat_key[0][1]
             strategy_name = str(strategy_obj)
@@ -375,6 +378,5 @@ def main() -> int | None:
             fig_3d.canvas.manager.set_window_title("3D Metrics (drag to rotate)")
         plt.show()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())

@@ -13,7 +13,10 @@ import pathlib
 import functools
 import enum
 import json
-from typing import Iterable
+import itertools
+from typing import Iterable, Callable
+from collections import deque
+from copy import deepcopy
 
 
 class Indices(storage.Storable):
@@ -310,10 +313,12 @@ class Pool(storage.Storable):
         if entry.id in data and storable_type != storage.StorableType.POOL:
             return data.retrieve(entry.id)
         payload = entry.payload
-        return Pool(
+        pool = Pool(
             indices=data.retrieve(payload['indices']),
             dataset=data.retrieve(payload['dataset_id']).lazy_train,
         )
+        data.encache(pool)
+        return pool
 
     @functools.cache
     def to_transformers_dataset(
@@ -567,27 +572,132 @@ class DataDatabase:
             self.__experiments = experiments.Experiments()
         return self.__experiments
 
-    def retrieve(self, id: storage.ID, force_load: bool = False) -> storage.Storable:
-        if id in self.objects_store and not force_load:
-            return self.objects_store[id]
-        if id in self.stored_index:
-            obj = storage.Storable.restore(self.stored_index[id].obj, self, self.stored_index[id].obj.type)
-            if id not in self.objects_store:
-                self.encache(obj)
-            if isinstance(obj, CompleteDataset) and obj.id not in self.datasets:
-                self.datasets.add(obj)
-            if isinstance(obj, experiments.Experiment) and obj not in self.experiments:
-                self.experiments.add(obj)
-            return obj
-        raise KeyError(f'Object with id {id} not found in the database')
+    def retrieve(self, obj_id: storage.ID, *, force_load: bool = False) -> storage.Storable:
+        if obj_id in self.objects_store and not force_load:
+            return self.objects_store[obj_id]
+        if obj_id in self.stored_index:
+            self.__recreate(self.stored_index[obj_id].obj)
+            return self.objects_store[obj_id]
+        raise KeyError(f'Object with id {obj_id} not found in the database')
 
-    def encache(self, obj: storage.Storable):
+    def encache(self, obj: storage.Storable, *, inconsistent_ok: bool = False):
         if obj.get_id() in self.objects_store:
             raise ValueError(f'Object with id {obj.get_id()} already exists in the cache')
         self.objects_store[obj.get_id()] = obj
-        if obj.get_id() not in self.stored_index:
-            self.add_to_store_index(obj.as_storable())
+        self.__on_cache_update(obj, inconsistent_ok=inconsistent_ok)
 
+    def destroy(self, id: storage.ID, *, inconsistent_ok: bool = False):
+        if id not in self.objects_store:
+            raise KeyError(f'Object with id {id} not found in the database')
+        obj = self.objects_store[id]
+        del self.objects_store[id]
+        if isinstance(obj, CompleteDataset):
+            del self.datasets[obj.id]
+        elif isinstance(obj, experiments.Experiment):
+            del self.experiments[obj]
+
+        if (
+            isinstance(obj, (experiments.Experiment, experiments.ExperimentHistory))
+            and obj in self.stored_index
+            and not inconsistent_ok
+        ):
+            print(
+                f'[WARNING]: {'Experiment' if isinstance(obj, experiments.Experiment) else 'ExperimentHistory'} {obj} with id {id} deleted from objects, but present in stored_index'
+            )
+
+    def add_to_store_index(
+        self,
+        obj: storage.StorableBundle | storage.StorableEntry,
+        *,
+        force: bool = False,
+        inconsistent_ok: bool | None = None,
+        inconsistent_on_disk_ok: bool | None = None,
+        inconsistent_in_cache_ok: bool | None = None,
+    ):
+        if inconsistent_ok is not None and (
+            inconsistent_on_disk_ok is not None or inconsistent_in_cache_ok is not None
+        ):
+            raise ValueError(
+                f"Incorrect parameter mix: {inconsistent_ok = }, {inconsistent_on_disk_ok = }, {inconsistent_in_cache_ok = }. First is incompatible with 2 other"
+            )
+        if inconsistent_ok is not None:
+            inconsistent_on_disk_ok = inconsistent_ok
+            inconsistent_in_cache_ok = inconsistent_ok
+        if inconsistent_on_disk_ok is None:
+            inconsistent_on_disk_ok = False
+        if inconsistent_in_cache_ok is None:
+            inconsistent_in_cache_ok = False
+
+        if isinstance(obj, storage.StorableEntry):
+            if force or obj.id not in self.stored_index:
+                stored = False
+                entry_format = None if obj.type != storage.StorableType.ARRAY else storage.Format.NPZ
+                if (
+                    not inconsistent_on_disk_ok
+                    and obj.id in self.stored_index
+                    and self.stored_index[obj.id].stored_on_disk
+                ):
+                    stored_entry = self.stored_index[obj.id]
+                    loaded = self.__load_from_disk_presumably(obj.id, stored_entry.format, obj.type)
+                    if self.storables_differ(loaded.obj, obj):
+                        print(
+                            f'[WARNING]: for object with id {id} stored entry on disk {loaded.obj} differs from entry being stored {obj}. Trying to merge...'
+                        )
+                        try:
+                            merged = self.merge_storables(obj, loaded.obj)
+                        except ValueError:
+                            print(
+                                f'[WARNING]: Failed to merge {id}, preferring entry being stored {obj}, leaving disk one unchanged'
+                            )
+                            merged = self.__try_merge_storables(obj, loaded.obj)
+                            obj = merged
+                        else:
+                            obj = merged
+                            self.__store_entry(obj, stored_entry.format)
+                            stored = True
+                            entry_format = stored_entry.format
+                self.stored_index[obj.id] = storage.StoredEntry(obj, stored=stored, format=entry_format)
+                self.__on_storage_update(obj, inconsistent_ok=inconsistent_in_cache_ok)
+            return
+        if isinstance(obj, storage.StorableBundle):
+            self.__add_to_store_index_rec(
+                obj.main,
+                obj,
+                force=force,
+                inconsistent_on_disk_ok=inconsistent_on_disk_ok,
+                inconsistent_in_cache_ok=inconsistent_in_cache_ok,
+            )
+            return
+        raise ValueError('Object must be either StorableEntry or StorableBundle')
+
+    def __add_to_store_index_rec(
+        self,
+        key: storage.ID,
+        bundle: storage.StorableBundle,
+        *,
+        force: bool = False,
+        inconsistent_on_disk_ok: bool = False,
+        inconsistent_in_cache_ok: bool = False,
+    ):
+        if key in self.stored_index and not force:
+            return
+        entry = bundle.entries[key]
+        self.add_to_store_index(
+            entry,
+            force=force,
+            inconsistent_on_disk_ok=inconsistent_on_disk_ok,
+            inconsistent_in_cache_ok=inconsistent_in_cache_ok,
+        )
+        for ref in entry.get_references():
+            self.__add_to_store_index_rec(
+                ref,
+                bundle,
+                force=force,
+                inconsistent_on_disk_ok=inconsistent_on_disk_ok,
+                inconsistent_in_cache_ok=inconsistent_in_cache_ok,
+            )
+
+    def __on_cache_update(self, obj: storage.Storable, *, inconsistent_ok: bool = False):
         if isinstance(obj, CompleteDataset):
             if obj.id not in self.datasets:
                 self.datasets.add(obj)
@@ -595,56 +705,99 @@ class DataDatabase:
             if obj not in self.experiments:
                 self.experiments.add(obj)
 
-    def add_to_store_index(self, obj: storage.StorableBundle | storage.StorableEntry, *, force: bool = False):
-        if isinstance(obj, storage.StorableEntry):
-            if force or obj.id not in self.stored_index:
-                self.stored_index[obj.id] = storage.StoredEntry(
-                    obj, stored=False, format=None if obj.type != storage.StorableType.ARRAY else storage.Format.NPZ
+        if not inconsistent_ok and obj.get_id() in self.stored_index:
+            encached = obj.as_storable()
+            encached = encached.entries[encached.main]
+            was = self.stored_index[obj.get_id()].obj
+            if DataDatabase.storables_differ(encached, was):
+                try:
+                    result = DataDatabase.merge_storables(encached, was)
+                except ValueError:
+                    print(
+                        f"[WARNING]: Can't merge storables {encached} and {was} with id {obj.get_id()}! Preferring encached {encached} for object {obj}"
+                    )
+                    result = DataDatabase.__try_merge_storables(encached, was)
+                self.add_to_store_index(result, force=True)
+
+    def __on_storage_update(self, obj: storage.StorableEntry, *, inconsistent_ok: bool = False):
+        if (
+            not inconsistent_ok
+            or obj.type == storage.StorableType.EXPERIMENT
+            or obj.type == storage.StorableType.DATASET
+        ) and obj.id in self.objects_store:
+            encached = self.objects_store[obj.id].as_storable()
+            encached = encached.entries[encached.main]
+            if DataDatabase.storables_differ(encached, obj):
+                print(
+                    f'[WARNING]: object being stored {obj} differs from encached object {encached}. Trying to merge...'
                 )
-            return
-        if isinstance(obj, storage.StorableBundle):
-            self.__add_to_store_index_rec(obj.main, obj, force=force)
-            return
-        raise ValueError('Object must be either StorableEntry or StorableBundle')
+                try:
+                    merged = self.merge_storables(encached, obj)
+                except ValueError:
+                    print(
+                        f'[WARNING]: Failed to merge {obj.id}, preferring the one just stored {obj}, differing from {encached}'
+                    )
+                    merged = self.__try_merge_storables(obj, encached)
+                self.destroy(merged.id, inconsistent_ok=True)
+                self.add_to_store_index(merged, force=True, inconsistent_ok=True)
+                if merged.id not in self.objects_store:
+                    self.__recreate(merged)
+        elif obj.type == storage.StorableType.EXPERIMENT or obj.type == storage.StorableType.DATASET:
+            self.__recreate(obj)
 
-    def __add_to_store_index_rec(self, key: storage.ID, bundle: storage.StorableBundle, *, force: bool = False):
-        if key in self.stored_index and not force:
-            return
-        entry = bundle.entries[key]
-        self.add_to_store_index(entry, force=force)
-        for ref in entry.get_references():
-            self.__add_to_store_index_rec(ref, bundle, force=force)
+    def __recreate(self, obj: storage.StorableEntry, *, inconsistent_after_encache_ok: bool = False):
+        if obj.id in self.objects_store:
+            raise ValueError(f'Trying to recreate existing object: {obj.id}')
+        if obj.id not in self.stored_index:
+            self.add_to_store_index(obj)
+        assert obj.payload == self.stored_index[obj.id].obj.payload
+        restored = storage.Storable.restore(obj, self, obj.type)
+        if restored.get_id() not in self.objects_store:
+            self.encache(restored, inconsistent_ok=inconsistent_after_encache_ok)
+        return obj
 
-    def __contains__(self, obj: 'storage.ID | experiments.Experiment | DatasetID') -> bool:
-        if isinstance(obj, storage.ID):
-            return obj in self.objects_store or obj in self.stored_index
-        if isinstance(obj, experiments.Experiment):
-            return obj in self.experiments
-        elif isinstance(obj, DatasetID):
-            return obj in self.datasets
-        return NotImplemented
-
-    def store_fast(self, obj: 'storage.StorableBundle', format: storage.Format, obj_id: storage.ID | None = None):
-        if obj_id is not None and obj_id in self.stored_index and not self.stored_index[obj_id].stored:
+    def store_fast(
+        self, bundle: 'storage.StorableBundle', obj_format: storage.Format, obj_id: storage.ID | None = None
+    ):
+        if (
+            obj_id is not None and obj_id in self.stored_index and not self.stored_index[obj_id].stored
+        ):  # Secondary objects that aren't the main object being stored fast should not be stored fast and should only be updated if they are already stored
             return
         if obj_id is None:
-            obj_id = obj.main
-        self.__store_entry(obj.entries[obj_id], format)
-        for ref in obj.entries[obj_id].get_references():
-            self.store_fast(obj, format.switch_format(obj.entries[ref].type), ref)
+            obj_id = bundle.main
+        self.__store_entry(bundle.entries[obj_id], obj_format, update_index=False)
+        for ref in bundle.entries[obj_id].get_references():
+            self.store_fast(bundle, obj_format.switch_format(bundle.entries[ref].type), ref)
         if obj_id not in self.stored_index:
-            self.stored_index[obj_id] = storage.StoredEntry(obj.entries[obj_id], stored=True, format=format)
+            self.stored_index[obj_id] = storage.StoredEntry(bundle.entries[obj_id], stored=True, format=obj_format)
+            self.__on_storage_update(self.stored_index[obj_id].obj)
         else:
+            if self.storables_differ(bundle.entries[obj_id], self.stored_index[obj_id].obj):
+                print(
+                    f'[WARNING]: entry being stored fast {bundle.entries[obj_id]} differs from entry already stored! Trying to merge...'
+                )
+                try:
+                    merged = self.merge_storables(bundle.entries[obj_id], self.stored_index[obj_id].obj)
+                except ValueError:
+                    print(
+                        f'[WARNING]: Failed to merge, preferring entry being stored {bundle.entries[obj_id]} over {self.stored_index[obj_id]}'
+                    )
+                    merged = self.__try_merge_storables(bundle.entries[obj_id], self.stored_index[obj_id].obj)
+                self.add_to_store_index(merged, force=True)
+                self.__store_entry(bundle.entries[obj_id], obj_format)
             self.stored_index[obj_id].stored = True
-            self.stored_index[obj_id].format = format
+            self.stored_index[obj_id].format = obj_format
 
-    def __store_entry(self, obj: 'storage.StorableEntry', format: storage.Format):
+    def __store_entry(self, obj: 'storage.StorableEntry', obj_format: storage.Format, *, update_index: bool = True):
         where = (
-            self.root_dir / storage.DATA_DIR / self.__get_rel_directory(obj.type) / format.format_name(obj.id, obj.type)
+            self.root_dir
+            / storage.DATA_DIR
+            / self.__get_rel_directory(obj.type)
+            / obj_format.format_name(obj.id, obj.type)
         )
         self.__pre_store_entry(obj, where)
-        storage.Formatter.dump(obj, format, where)
-        self.__post_store_entry(obj, where, format)
+        storage.Formatter.dump(obj, obj_format, where)
+        self.__post_store_entry(obj, where, obj_format, update_index=update_index)
 
     def __get_rel_directory(self, entry_type: storage.StorableType) -> pathlib.Path:
         match entry_type:
@@ -668,215 +821,212 @@ class DataDatabase:
     def __pre_store_entry(self, obj: 'storage.StorableEntry', where: pathlib.Path):
         where.parent.mkdir(parents=True, exist_ok=True)
 
-    def __post_store_entry(self, obj: 'storage.StorableEntry', where: pathlib.Path, format: 'storage.Format'):
-        self.stored_index[obj.id] = storage.StoredEntry(obj, stored=True, format=format)
+    def __post_store_entry(
+        self,
+        obj: 'storage.StorableEntry',
+        where: pathlib.Path,
+        obj_format: 'storage.Format',
+        *,
+        update_index: bool = True,
+    ):
+        if update_index:
+            self.stored_index[obj.id] = storage.StoredEntry(obj, stored=True, format=obj_format)
+            self.__on_storage_update(self.stored_index[obj.id].obj)
 
     def dump(self):
         path = self.root_dir / storage.DATA_DIR / f'{self.get_config_name()}.json'
         last_backup_id = self.__pre_dump(path)
+        current_backup_id = last_backup_id + 1
         if not self.local:
             assert False, 'TODO: implement remote'
-        config = self.__generate_storables(last_backup_id + 1)
+        config = self.__generate_storables(current_backup_id)
         for entry in self.stored_index.values():
             if not entry.stored and not entry.obj.type.is_groupable():
-                format = storage.Format.JSON.switch_format(entry.obj.type)
-                self.__store_entry(entry.obj, format)
-                entry.stored = True
-                entry.format = format
+                entry_format = storage.Format.JSON.switch_format(entry.obj.type)
+                self.__store_entry(entry.obj, entry_format)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open('w') as dbf:
             json.dump(config, dbf)
-        self.__post_dump(last_backup_id + 1)
+        self.__post_dump(current_backup_id)
 
-    def __pre_dump(self, path: pathlib.Path) -> int:
+    def __pre_dump(self, new_config_path: pathlib.Path) -> int:
         if not self.local:
             assert False, 'TODO: implement remote'
-        backup_id = 0
-        if path.exists():
-            with path.open('r') as dbf:
+        previous_backup_id = 0
+        if new_config_path.exists():
+            with new_config_path.open('r') as dbf:
                 old_config = json.load(dbf)
-            backup_id = old_config.get('backup_id', 1)
-            path.rename(path.parent / f'{self.get_config_name()}_{backup_id + 1}.json')
+            previous_backup_id = old_config.get('backup_id', 1)
+            new_config_path.rename(new_config_path.parent / f'{self.get_config_name()}_{previous_backup_id + 1}.json')
         for obj in self.objects_store.values():
-            if obj.as_storable().entries[obj.get_id()] != self.stored_index[obj.get_id()].obj:
+            encached = obj.as_storable()
+            encached = encached.entries[encached.main]
+            if obj.get_id() not in self.stored_index:
+                self.add_to_store_index(obj.as_storable(), inconsistent_in_cache_ok=True)
+            elif self.storables_differ(encached, self.stored_index[obj.get_id()].obj):
+                print(
+                    f'[WARNING]: during dump for id {encached.id} inconsistent storable {self.stored_index[obj.get_id()].obj} and encached object {encached}! Preferring encached'
+                )
                 self.add_to_store_index(obj.as_storable(), force=True)
 
-        return backup_id
+        return previous_backup_id
 
-    def __post_dump(self, backup_id: int):
+    def __post_dump(self, current_backup_id: int):
         if not self.local:
             assert False, 'TODO: implement remote'
-        killable_old = self.root_dir / storage.DATA_DIR / f'{self.get_config_name()}_{backup_id - 4}.json'
+        killable_old = (
+            self.root_dir
+            / storage.DATA_DIR
+            / f'{self.get_config_name()}_{current_backup_id - DataDatabase.BACKUPS_COUNT + 1}.json'
+        )  # Assume continious increasing backup ids
         if killable_old.exists():
             killable_old.unlink()
 
-    def __is_grouped(self, entry: 'storage.StoredEntry', path: pathlib.Path | None) -> bool:
-        return entry.format is None and (path is None or not path.exists())
-
-    def __is_recollectable(
-        self, id: 'storage.ID', entry: 'storage.StoredEntry', loaded_entry: 'storage.StoredEntry'
-    ) -> bool:
-        if id not in self.objects_store:
-            return True
-        bundle = self.objects_store[id].as_storable()
-        if bundle.entries[bundle.main] != loaded_entry.obj:
-            print(f'[WARNING]: stored entry differs from RAM entry: {id}')
-        return True
-
     def recollect_stored(self):
-        files: list[pathlib.Path] = []
+        recollected_files: list[pathlib.Path] = []
         tmp_dict = dict(self.stored_index)
-        for id, entry in tmp_dict.items():
-            path = None
-            for format in storage.Format:
-                try:
-                    path = (
-                        self.root_dir
-                        / storage.DATA_DIR
-                        / self.__get_rel_directory(entry.obj.type)
-                        / format.format_name(id, entry.obj.type)
-                    )
-                    if path.exists():
-                        break
-                except ValueError:
-                    continue
-            if not entry.obj.type.is_groupable() or self.__is_grouped(entry, path):
-                continue
-
-            loaded_entry = self.__load_from_disk(
-                {
-                    'refs': {
-                        id: {
-                            'path': str(path),
-                            'format': format.value,
-                        }
-                    }
-                },
-                id,
-            )
-
-            if self.__is_recollectable(id, entry, loaded_entry):
-                if id in self.objects_store:
-                    obj = entry.obj
-                    bundle = self.objects_store[id].as_storable()
-                    if (
-                        bundle.entries[bundle.main] != loaded_entry.obj
-                        and bundle.entries[bundle.main].type == storage.StorableType.EXPERIMENT
-                    ):
-                        current_entry = bundle.entries[bundle.main]
-                        obj = (
-                            current_entry
-                            if len(current_entry.payload['histories']) > len(loaded_entry.obj.payload['histories'])
-                            else loaded_entry.obj
-                        )
-                        print(f'diff: {current_entry.payload['histories']} -- {loaded_entry.obj.payload['histories']}')
-                    del self.stored_index[id]
-                    if entry.obj.type == storage.StorableType.EXPERIMENT:
-                        key = experiments.Experiments.ExperimentKey.from_experiment(self.objects_store[id])
-                        del self.experiments[key]
-
-                    if entry.obj.type == storage.StorableType.DATASET:
-                        del self.datasets[DatasetID.from_str(entry.obj.payload['dataset'])]
-                    del self.objects_store[id]
-                    self.add_to_store_index(obj)
+        for obj_id, stored_entry in tmp_dict.items():
+            if stored_entry.stored_on_disk and stored_entry.obj.type.is_groupable():
+                path = (
+                    self.root_dir
+                    / storage.DATA_DIR
+                    / self.__get_rel_directory(stored_entry.obj.type)
+                    / stored_entry.format.format_name(obj_id, stored_entry.obj.type)
+                )
+                loaded = self.__load_from_disk_by_path(obj_id, path)
+                assert obj_id in self.stored_index
+                if obj_id in self.objects_store:
+                    encached = self.objects_store[obj_id].as_storable()
+                    encached = encached.entries[encached.main]
+                    assert not self.storables_differ(encached, self.stored_index[obj_id].obj)
+                    if self.storables_differ(stored_entry.obj, loaded.obj):
+                        try:
+                            merged = self.merge_storables(stored_entry.obj, loaded.obj)
+                        except ValueError:
+                            print(
+                                f'[ERROR]: Failed to recollect object with id {obj_id}. Skipping {path}. On disk: {loaded.obj}, in RAM: {stored_entry.obj}.'
+                            )
+                        else:
+                            self.add_to_store_index(merged, force=True, inconsistent_on_disk_ok=True)
+                            recollected_files.append(path)
+                            self.stored_index[obj_id].stored = False
+                            self.stored_index[obj_id].format = None
+                    else:
+                        recollected_files.append(path)
+                        self.stored_index[obj_id].stored = False
+                        self.stored_index[obj_id].format = None
                 else:
-                    self.stored_index[id] = loaded_entry
-                self.stored_index[id].stored = False
-                self.stored_index[id].format = None
-
-                files.append(path)
+                    if self.storables_differ(stored_entry.obj, loaded.obj):
+                        try:
+                            merged = self.merge_storables(stored_entry.obj, loaded.obj)
+                        except ValueError:
+                            print(
+                                f'[ERROR]: Failed to recollect object with id {obj_id}. Skipping {path}. On disk: {loaded.obj}, in RAM: {stored_entry.obj}.'
+                            )
+                        else:
+                            self.add_to_store_index(merged, force=True, inconsistent_ok=True)
+                            recollected_files.append(path)
+                            self.stored_index[obj_id].stored = False
+                            self.stored_index[obj_id].format = None
+                    else:
+                        recollected_files.append(path)
+                        self.stored_index[obj_id].stored = False
+                        self.stored_index[obj_id].format = None
 
         self.dump()
 
-        for file in files:
+        for file in recollected_files:
+            print(f'[WARNING]: deleting file {file}')
             file.unlink()
 
-        data_dir = self.root_dir / storage.DATA_DIR
-        for dir in (
-            data_dir,
-            data_dir / 'experiments',
-            data_dir / 'experiments' / 'histories',
-            data_dir / 'datasets',
-            data_dir / 'markup',
-            data_dir / 'bin',
-        ):
-            if not dir.exists():
-                continue
-            for file in dir.iterdir():
-                if file.name == '.DS_Store':
-                    continue
-                if file.is_file() and not file.name.startswith(self.get_config_name()):
-                    stored_type = storage.Format.type_from_format_name(file.name)
-                    if not stored_type.is_groupable():
-                        continue
-                    stored_id = file.name.rsplit('_', 1)[0]
-                    if stored_id in self.stored_index:
-                        file.unlink()
-                    else:
-                        print(f'[WARNING]: unindexed file: {file}')
+        def warn_unindexed(folder: pathlib.Path, file: pathlib.Path):
+            stored_type = storage.Format.type_from_format_name(file.name)
+            if not stored_type.is_groupable():
+                return
+            stored_id = storage.Format.id_from_format_name(file.name)
+            if stored_id not in self.stored_index:
+                print(f'[WARNING]: unindexed file: {file} for id {stored_id} with type {stored_type}')
+
+        self.__walk_local_storage(warn_unindexed)
 
     def try_restore(self):
-        data_dir = self.root_dir / storage.DATA_DIR
-        for dir in (
-            data_dir,
-            data_dir / 'experiments',
-            data_dir / 'experiments' / 'histories',
-            data_dir / 'datasets',
-            data_dir / 'markup',
-            data_dir / 'bin',
+        def process_file(folder: pathlib.Path, file: pathlib.Path):
+            stored_id = storage.Format.id_from_format_name(file.name)
+            loaded = self.__load_from_disk_by_path(stored_id, self.root_dir / storage.DATA_DIR / file)
+            if stored_id not in self.stored_index and stored_id not in self.objects_store:
+                self.add_to_store_index(loaded.obj)
+            elif stored_id not in self.stored_index and stored_id in self.objects_store:
+                print(f'[WARNING]: unindexed stored file: {file} that was recreated: {stored_id}')
+                was = self.objects_store[stored_id]
+                bundle = was.as_storable()
+                entry = bundle.entries[bundle.main]
+                merged = DataDatabase.merge_storables(entry, loaded.obj)
+                self.destroy(merged.id, inconsistent_ok=True)
+                self.add_to_store_index(merged)
+            elif stored_id not in self.objects_store:
+                if self.storables_differ(self.stored_index[stored_id].obj, loaded.obj):
+                    merged = DataDatabase.merge_storables(loaded.obj, self.stored_index[stored_id].obj)
+                    self.add_to_store_index(merged, force=True)
+                else:
+                    print(f'[WARNING]: Consistent stored on disk file: {file}. Marking as stored on disk')
+                    self.stored_index[stored_id].stored = True
+                    self.stored_index[stored_id].format = storage.Format.format_from_format_name(file.name)
+            else:
+                bundle = self.objects_store[stored_id].as_storable()
+                entry = bundle.entries[bundle.main]
+                assert not self.storables_differ(self.stored_index[stored_id].obj, entry)
+                if self.storables_differ(self.stored_index[stored_id].obj, loaded.obj):
+                    try:
+                        merged = DataDatabase.merge_storables(loaded.obj, self.stored_index[stored_id].obj)
+                    except ValueError as e:
+                        print(
+                            f'[WARNING]: `{e}`. Preferring live object, merging into it. Live: {self.stored_index[stored_id].obj}, loaded: {loaded.obj}',
+                            end='',
+                        )
+                        merged = DataDatabase.__try_merge_storables(self.stored_index[stored_id].obj, loaded.obj)
+                        print(f', merged: {merged.payload}')
+                    self.destroy(merged.id, inconsistent_ok=True)
+                    self.add_to_store_index(merged, force=True)
+                    if not self.stored_index[stored_id].stored_on_disk:
+                        # print(
+                        #     f"[WARNING]: Merged id {loaded.obj.id} into memory, but didn't change file {file}, because object in database was not stored on disk. Merged: {merged}, loaded: {loaded.obj}"
+                        # )
+                        self.__store_entry(
+                            self.stored_index[stored_id].obj, self.stored_index[stored_id].format or storage.Format.JSON
+                        )
+                else:
+                    print(f'[WARNING]: Consistent stored on disk file: {file}. Marking as stored on disk')
+                    self.stored_index[stored_id].stored = True
+                    self.stored_index[stored_id].format = storage.Format.format_from_format_name(file.name)
+
+        self.__walk_local_storage(process_file)
+
+    def __walk_local_storage(self, callback: Callable[[pathlib.Path, pathlib.Path], None]):
+        data_folder = self.root_dir / storage.DATA_DIR
+        for folder in (
+            data_folder / 'datasets',
+            data_folder / 'experiments' / 'histories',
+            data_folder / 'experiments',
+            data_folder / 'markup',
+            data_folder / 'bin',
+            data_folder,
         ):
-            if not dir.exists():
+            if not folder.exists():
                 continue
-            for file in dir.iterdir():
+            for file in folder.iterdir():
                 if file.name == '.DS_Store':
                     continue
                 if file.is_file() and not file.name.startswith(self.get_config_name()):
-                    stored_id = file.name.rsplit('_', 1)[0]
-                    if stored_id not in self.stored_index:
-                        if stored_id in self.objects_store:
-                            print(f'[WARNING]: unindexed stored file: {file} that was recreated: {stored_id}')
-                        else:
-                            self.stored_index[stored_id] = self.__load_from_disk(
-                                {
-                                    'refs': {
-                                        stored_id: {
-                                            'path': str(file.relative_to(self.root_dir / storage.DATA_DIR)),
-                                            'format': storage.Format.format_from_format_name(file.name).value,
-                                        }
-                                    }
-                                },
-                                stored_id,
-                            )
-                    else:
-                        loaded = self.__load_from_disk(
-                            {
-                                'refs': {
-                                    stored_id: {
-                                        'path': str(file.relative_to(self.root_dir / storage.DATA_DIR)),
-                                        'format': storage.Format.format_from_format_name(file.name).value,
-                                    }
-                                }
-                            },
-                            stored_id,
-                        )
-                        if self.stored_index[stored_id].obj != loaded.obj:
-                            print(f'[WARNING]: stored entry differs from RAM entry: {stored_id}')
-                            if self.stored_index[stored_id].obj.type == storage.StorableType.EXPERIMENT:
-                                current_entry = self.stored_index[stored_id].obj
-                                loaded_entry = loaded.obj
-                                obj = (
-                                    current_entry
-                                    if len(current_entry.payload['histories']) > len(loaded_entry.payload['histories'])
-                                    else loaded_entry
-                                )
-                                del self.stored_index[stored_id]
-                                if stored_id in self.objects_store:
-                                    key = experiments.Experiments.ExperimentKey.from_experiment(
-                                        self.objects_store[stored_id]
-                                    )
-                                    del self.experiments[key]
-                                    del self.objects_store[stored_id]
-                                self.add_to_store_index(obj)
+                    callback(folder, file.relative_to(data_folder))
+
+    def __contains__(self, obj: 'storage.ID | experiments.Experiment | DatasetID') -> bool:
+        if isinstance(obj, storage.ID):
+            return obj in self.objects_store or obj in self.stored_index
+        if isinstance(obj, experiments.Experiment):
+            return obj in self.experiments
+        elif isinstance(obj, DatasetID):
+            return obj in self.datasets
+        return NotImplemented
 
     def get_dataset(self, obj: DatasetID, text_field: str = 'text', label_field: str = 'label') -> CompleteDataset:
         if obj in self.datasets:
@@ -892,13 +1042,16 @@ class DataDatabase:
         return dataset
 
     def get_experiment(self, obj: 'experiments.Experiment') -> 'experiments.Experiment':
-        if obj.get_id() in self.stored_index:
-            exp = experiments.Experiment.from_storable(self.stored_index[obj.get_id()].obj, self)
-            if exp not in self.experiments:
-                self.experiments.add(exp)
-            return exp
+        if obj.get_id() in self.stored_index and obj.get_id() not in self.objects_store:
+            raise RuntimeError(
+                f'[ERROR]: Inconsistent stored_index and objects_store for Experiment; id: {obj.get_id()}, experiment: {self.stored_index[obj.get_id()]}'
+            )
+            # exp = experiments.Experiment.from_storable(self.stored_index[obj.get_id()].obj, self)
+            # if exp not in self.experiments:
+            #     self.experiments.add(exp)
+            # return exp
         if obj in self.experiments:
-            return self.experiments[experiments.Experiments.ExperimentKey.from_experiment(obj)][0]
+            return self.experiments[obj][0]
         self.encache(obj)
         return obj
 
@@ -910,30 +1063,44 @@ class DataDatabase:
         return {
             'backup_id': backup_id,
             'objects': {
-                id: {
+                obj_id: {
                     'type': entry.obj.type.value,
                     'payload': entry.obj.payload,
                 }
-                for id, entry in self.stored_index.items()
-                if not entry.stored and entry.obj.type.is_groupable()
+                for obj_id, entry in self.stored_index.items()
+                if not entry.stored_on_disk and entry.obj.type.is_groupable()
             },
             'refs': {
-                id: {
-                    'path': str(
-                        self.__get_rel_directory(entry.obj.type) / entry.format.format_name(id, entry.obj.type)
+                obj_id: {
+                    'path': str(  # TODO: rename everywhere and check `rel_path`
+                        self.__get_rel_directory(entry.obj.type) / entry.format.format_name(obj_id, entry.obj.type)
                     ),
                     'format': entry.format.value,
+                    # TODO: Add 'type': entry.obj.type.value,
                     # TODO: consider remote
                 }
-                for id, entry in self.stored_index.items()
-                if entry.stored or not entry.obj.type.is_groupable()
+                for obj_id, entry in self.stored_index.items()
+                if entry.stored_on_disk
+                or (
+                    not entry.obj.type.is_groupable()
+                    and (
+                        print(
+                            f'[WARNING]: ungrouppable entry {entry.obj.id} is not stored on disk after pre dump during storables list generation! Entry contents: {entry}'
+                        )
+                        and True
+                    )
+                )
             },
             'experiments': [exp.get_id() for exp in self.experiments],
             'datasets': [dataset.get_id() for dataset in self.datasets],
         }
 
     @classmethod
-    def load(cls, config_path: pathlib.Path, root_dir: pathlib.Path, local: bool = True) -> 'DataDatabase':
+    def load_default_config_name(cls, root_dir: pathlib.Path, *, local: bool = True) -> 'DataDatabase':
+        return cls.load(f'{cls.get_config_name()}.json', root_dir, local=local)
+
+    @classmethod
+    def load(cls, config_path: pathlib.Path, root_dir: pathlib.Path, *, local: bool = True) -> 'DataDatabase':
         if not local:
             assert False, 'TODO: implement remote'
         if not config_path.exists():
@@ -945,29 +1112,82 @@ class DataDatabase:
         return db
 
     def __load_config(self, config: dict):
-        for id, obj in config['objects'].items():
-            self.stored_index[id] = storage.StoredEntry(
+        for obj_id, obj in config['objects'].items():
+            self.stored_index[obj_id] = storage.StoredEntry(
                 obj=storage.StorableEntry(
                     payload=obj['payload'],
                     type=storage.StorableType(obj['type']),
-                    id=id,
+                    id=obj_id,
                 ),
                 stored=False,
                 format=None,
             )
         dead_ids = []
-        for id in config['refs']:
+        for obj_id in config['refs']:
             try:
-                self.stored_index[id] = self.__load_from_disk(
-                    config, id
+                self.stored_index[obj_id] = self.__load_from_disk(
+                    config, obj_id
                 )  # TODO: consider adding refs not to load everything on start
             except FileNotFoundError:
-                print(f'[WARNING]: file for stored object with id {id} not found')
-                dead_ids.append(id)
+                print(f'[WARNING]: file for stored object with id {obj_id} not found, considering it dead id')
+                dead_ids.append(obj_id)
 
-        i = 0
-        while i < len(dead_ids):
-            id = dead_ids[i]
+        self.__recursively_clean_dead_ids(dead_ids)
+
+        assert not self.objects_store
+        assert not tuple(self.experiments)
+        assert not tuple(self.datasets)
+
+        for obj_id in itertools.chain(config['datasets'], config['experiments']):
+            if obj_id not in self.objects_store and obj_id in self.stored_index:
+                self.__recreate(self.stored_index[obj_id].obj, inconsistent_after_encache_ok=True)
+
+    def __load_from_disk(self, config: dict, obj_id: 'storage.ID') -> 'storage.StoredEntry':
+        if not self.local:
+            assert False, 'TODO: implement remote'
+
+        if obj_id not in config['refs']:
+            raise KeyError(f'Object with id {obj_id} not found in config')
+        content = config['refs'][obj_id]
+        obj_format = storage.Format(content['format'])
+        path: pathlib.Path = self.root_dir / storage.DATA_DIR / content['path']
+        if not path.exists():
+            raise FileNotFoundError(f'File {path} does not exist for object with id {obj_id}')
+        entry = storage.Formatter.load(obj_format, path)
+        return storage.StoredEntry(obj=entry, stored=True, format=obj_format)
+
+    def __load_from_disk_presumably(
+        self, id: 'storage.ID', entry_format: storage.Format, entry_type: storage.StorableType
+    ) -> 'storage.StoredEntry':
+        if not self.local:
+            assert False, 'TODO: implement remote'
+
+        path: pathlib.Path = (
+            self.root_dir
+            / storage.DATA_DIR
+            / self.__get_rel_directory(entry_type)
+            / entry_format.format_name(id, entry_type)
+        )
+        if not path.exists():
+            raise FileNotFoundError(f'File {path} does not exist for object with id {id}')
+        entry = storage.Formatter.load(entry_format, path)
+        return storage.StoredEntry(obj=entry, stored=True, format=entry_format)
+
+    def __load_from_disk_by_path(self, id: 'storage.ID', path: pathlib.Path) -> 'storage.StoredEntry':
+        if not self.local:
+            assert False, 'TODO: implement remote'
+
+        entry_format = storage.Format.format_from_format_name(path.name)
+
+        if not path.exists():
+            raise FileNotFoundError(f'File {path} does not exist for object with id {id}')
+        entry = storage.Formatter.load(entry_format, path)
+        return storage.StoredEntry(obj=entry, stored=True, format=entry_format)
+
+    def __recursively_clean_dead_ids(self, dead_ids: deque[int]):
+        to_be_died = set(dead_ids)
+        while dead_ids:
+            dead_id = dead_ids.popleft()
 
             tmp = dict(self.stored_index)
             for stored_id, entry in tmp.items():
@@ -975,42 +1195,14 @@ class DataDatabase:
                     storage.StorableType.EXPERIMENTS,
                     storage.StorableType.DATASETS,
                     storage.StorableType.LLM_LABELS,
-                ):
+                ):  # Assumes everything is already loaded into stored_index
                     continue
-                if id in entry.obj.get_references():
-                    print(f'[WARNING]: incomplete object {stored_id} removing from stored index')
+                if dead_id in entry.obj.get_references():
+                    print(f'[WARNING]: incomplete object {stored_id} removing from stored index. Content: {entry.obj}')
                     del self.stored_index[stored_id]
-                    dead_ids.append(stored_id)
-            i += 1
-
-        for id in config['experiments']:
-            if id not in self.objects_store and id in self.stored_index:
-                obj = storage.Storable.restore(self.stored_index[id].obj, self)
-                if obj.get_id() not in self.objects_store:
-                    self.encache(obj)
-                if obj not in self.experiments:
-                    self.experiments.add(obj)
-        for id in config['datasets']:
-            if id not in self.objects_store and id in self.stored_index:
-                obj = storage.Storable.restore(self.stored_index[id].obj, self)
-                if obj.get_id() not in self.objects_store:
-                    self.encache(obj)
-                if obj not in self.datasets:
-                    self.datasets.add(obj)
-
-    def __load_from_disk(self, config: dict, id: 'storage.ID') -> 'storage.StoredEntry':
-        if not self.local:
-            assert False, 'TODO: implement remote'
-
-        if id not in config['refs']:
-            raise KeyError(f'Object with id {id} not found in config')
-        content = config['refs'][id]
-        format = storage.Format(config['refs'][id]['format'])
-        path: pathlib.Path = self.root_dir / storage.DATA_DIR / content['path']
-        if not path.exists():
-            raise FileNotFoundError(f'File {path} does not exist for object with id {id}')
-        entry = storage.Formatter.load(format, path)
-        return storage.StoredEntry(obj=entry, stored=True, format=format)
+                    if stored_id not in to_be_died:
+                        dead_ids.append(stored_id)
+                        to_be_died.add(stored_id)
 
     # def connect(self) -> "DataDatabase":
     #     if self.__connected:
@@ -1022,13 +1214,60 @@ class DataDatabase:
     #         self.load()
     #     return self
 
+    @staticmethod
+    def storables_differ(obj1: 'storage.StorableEntry', obj2: 'storage.StorableEntry') -> bool:
+        if obj1.type != obj2.type:
+            raise ValueError('Can\'t compare different types')
+        return obj1.payload != obj2.payload
+
+    @staticmethod
+    def merge_storables(obj1: 'storage.StorableEntry', obj2: 'storage.StorableEntry') -> 'storage.StorableEntry':
+        res1 = DataDatabase.__try_merge_storables(obj1, obj2)
+        res2 = DataDatabase.__try_merge_storables(obj2, obj1)
+        if res1.payload != res2.payload:
+            raise ValueError(
+                f'[ERROR]: Inconsistent merging! ids: {res1.id}, {res2.id}, type: {res1.type}, merge results: {res1.payload}, {res2.payload}'
+            )
+
+        return res1
+
+    @staticmethod
+    def __try_merge_storables(
+        main: 'storage.StorableEntry', secondary: 'storage.StorableEntry'
+    ) -> 'storage.StorableEntry':
+        if main.type != secondary.type:
+            raise ValueError('Can\'t merge different types')
+        if main.type == storage.StorableType.EXPERIMENT:
+            payload = deepcopy(main.payload)
+            l1 = len(payload['histories'])
+            l2 = len(secondary.payload['histories'])
+            if l2 > l1:
+                payload['histories'].update(
+                    {i: secondary.payload['histories'][i] for i in map(str, range(l1 + 1, l2 + 1))}
+                )
+            if not all(
+                secondary.payload['histories'][i] in payload['histories'].values()
+                for i in map(str, range(1, min(l1, l2) + 1))
+            ):
+                j = max(l1, l2) + 1
+                for hist in secondary.payload['histories'].values():
+                    if hist not in payload['histories'].values():
+                        payload['histories'][str(j)] = hist
+                        j += 1
+            payload['runs'] = len(payload['histories'])
+            payload['histories'] = dict(
+                map(lambda x: (str(x[0]), x[1]), enumerate(sorted(payload['histories'].values()), start=1))
+            )
+            return storage.StorableEntry(payload, main.type, main.id)
+        raise ValueError(f'Unknown types for merge: {main.type}')
+
     def __enter__(self):
         if not self.local:  # TODO: implement remote
             raise NotImplementedError('Remote databases are not implemented yet')
 
-        path = self.root_dir / storage.DATA_DIR / f'{self.get_config_name()}.json'
-        if path.exists():
-            tmp = DataDatabase.load(path, self.root_dir, self.local)
+        config_path = self.root_dir / storage.DATA_DIR / f'{self.get_config_name()}.json'
+        if config_path.exists():
+            tmp = DataDatabase.load(config_path, self.root_dir, local=self.local)
             self.objects_store = tmp.objects_store
             self.stored_index = tmp.stored_index
             self.__datasets = tmp.__datasets
