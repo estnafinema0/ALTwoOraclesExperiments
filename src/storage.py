@@ -306,10 +306,11 @@ class StoredEntry:
     @property
     def grouped(self) -> bool:
         return self.format is None
-    
+
     @property
     def stored_on_disk(self) -> bool:
         return self.stored and not self.grouped
+
 
 class Formatter:
     @staticmethod

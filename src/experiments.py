@@ -175,7 +175,7 @@ class Experiment(Storable):
     @property
     def sorted_histories(self) -> list[ExperimentHistory]:
         return [h[1] for h in sorted(self.histories.items(), key=lambda p: p[0])[: self.runs]]
-    
+
     def remove_history_run(self, run_number):
         if run_number not in self.histories:
             raise ValueError(f'No such history that has run number {run_number}')
@@ -422,15 +422,25 @@ class Experiments(Storable):
         # def set(self, property, value) -> "Experiments.ExperimentKey":
         #     return dataclasses.replace(self, **{property: value})
 
-    @dataclasses.dataclass(eq=True)
+    @dataclasses.dataclass(eq=True, slots=True)
     class ExperimentInfo:
         force: bool | None = None
+        expected_runs: int | None = None
 
-    def __init__(self, *experiments: Experiment):
+    def __init__(self, *experiments: Experiment, runss: int | Iterable[int] | None = None):
         self.experiments = list(experiments)
         self.__experiments_map = {
-            Experiments.ExperimentKey.from_experiment(exp): (exp, i, Experiments.ExperimentInfo())
-            for i, exp in enumerate(experiments)
+            Experiments.ExperimentKey.from_experiment(exp): (exp, i, Experiments.ExperimentInfo(expected_runs=runs))
+            for i, (exp, runs) in enumerate(
+                zip(
+                    experiments,
+                    (
+                        itertools.repeat(None)
+                        if runss is None
+                        else itertools.repeat(runss) if isinstance(runss, int) else runss
+                    ),
+                )
+            )
         }
 
     def __iter__(self):
@@ -516,6 +526,7 @@ class Experiments(Storable):
         bugdets: list[int],
         splits: list[int],
         al_batch_size: int,
+        runs: int | Iterable[int] | None = None,
     ) -> 'Experiments':
         return Experiments(
             *(
@@ -539,42 +550,87 @@ class Experiments(Storable):
                     bugdets,
                     splits,
                 )
-            )
+            ),
+            runss=runs,
         )
 
     def run_all(
         self,
         tokenizer: 'BertTokenizerFast',
         fine_tuning_model: str,
-        runs: int,
         database: 'database.DataDatabase',
         *,
+        runs_in_depth: bool = True,
+        runs: int | None = None,
         default_force: bool = False,
         experiment_iteration_callback: Callable[[int, Experiment, ExperimentInfo], None] | None = None,
         run_iteration_callback: Callable[[Experiment, int], None] | None = None,
     ):
-        for i, experiment in enumerate(self.experiments):
-            experiment_info = self.__experiments_map[Experiments.ExperimentKey.from_experiment(experiment)][2]
-            force = default_force if experiment_info.force is None else experiment_info.force
-            exp: Experiment = database.get_experiment(experiment)
-            if exp.runs >= runs and not force:
-                self.set(exp)
-            else:
-                starting_point = exp.runs + 1 if exp.runs > 0 else 1
-                if experiment_iteration_callback is not None:
-                    experiment_iteration_callback(i, exp, experiment_info)
-                exp.run(
-                    tokenizer,
-                    fine_tuning_model,
-                    database,
-                    repeat=runs,
-                    from_run=starting_point,
-                    run_iteration_callback=run_iteration_callback,
-                )
-                database.store_fast(exp.as_storable(), Format.JSON)
-                self.set(exp)
+        if runs is None and any(info.expected_runs is None for _, _, info in self.__experiments_map.values()):
+            raise ValueError('Can\'t run all experiments, because runs aren\'t provided for all iteration space')
 
-    def __getitem__(self, key: 'Experiments.ExperimentKey | Experiment') -> tuple[Experiment, int, 'Experiments.ExperimentInfo']:
+        if runs_in_depth:
+            for i, experiment in enumerate(self.experiments):
+                experiment_info = self.__experiments_map[experiment][2]
+                force = default_force if experiment_info.force is None else experiment_info.force
+                exp_runs: int = experiment_info.expected_runs if runs is None else runs
+                exp: Experiment = database.get_experiment(
+                    experiment
+                )  # TODO: think a way to refactor in order not to merge constantly
+                if exp.runs >= exp_runs and not force:
+                    self.set(exp)
+                else:
+                    starting_point = exp.runs + 1 if exp.runs > 0 else 1
+                    if experiment_iteration_callback is not None:
+                        experiment_iteration_callback(i + 1, exp, experiment_info)
+                    exp.run(
+                        tokenizer,
+                        fine_tuning_model,
+                        database,
+                        repeat=exp_runs,
+                        from_run=starting_point,
+                        run_iteration_callback=run_iteration_callback,
+                    )
+                    database.store_fast(exp.as_storable(), Format.JSON)
+                    self.set(exp)
+        else:
+            max_runs = max(
+                [runs]
+                if runs is not None
+                else (
+                    experiment_info.expected_runs
+                    for _, _, experiment_info in self.__experiments_map.values()
+                    if experiment_info.expected_runs is not None
+                )
+            )
+            for current_runs in range(1, max_runs):
+                for i, experiment in enumerate(self.experiments):
+                    experiment_info = self.__experiments_map[experiment][2]
+                    force = default_force if experiment_info.force is None else experiment_info.force
+                    exp_runs: int = min(experiment_info.expected_runs if runs is None else runs, current_runs)
+                    exp: Experiment = database.get_experiment(
+                        experiment
+                    )  # TODO: think a way to refactor in order not to merge constantly
+                    if exp.runs >= exp_runs and not force:
+                        self.set(exp)
+                    else:
+                        starting_point = exp.runs + 1 if exp.runs > 0 else 1
+                        if experiment_iteration_callback is not None:
+                            experiment_iteration_callback(i, exp, experiment_info)
+                        exp.run(
+                            tokenizer,
+                            fine_tuning_model,
+                            database,
+                            repeat=exp_runs,
+                            from_run=starting_point,
+                            run_iteration_callback=run_iteration_callback,
+                        )
+                        database.store_fast(exp.as_storable(), Format.JSON)
+                        self.set(exp)
+
+    def __getitem__(
+        self, key: 'Experiments.ExperimentKey | Experiment'
+    ) -> tuple[Experiment, int, 'Experiments.ExperimentInfo']:
         if isinstance(key, Experiment):
             key = Experiments.ExperimentKey.from_experiment(key)
         matching = {e for e in self.__experiments_map.keys() if e.equivalent(key)}
@@ -674,8 +730,8 @@ class Experiments(Storable):
         )
         self.experiments.sort(key=key_func)
         for i, exp in enumerate(self.experiments):
-            self.__experiments_map[Experiments.ExperimentKey.from_experiment(exp)] = (
+            self.__experiments_map[exp] = (
                 exp,
                 i,
-                self.__experiments_map[Experiments.ExperimentKey.from_experiment(exp)][2],
+                self.__experiments_map[exp][2],
             )

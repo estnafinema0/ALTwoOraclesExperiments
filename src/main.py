@@ -15,6 +15,7 @@ from transformers.utils.logging import disable_progress_bar
 import pathlib
 from types import MethodType
 
+
 def ensure_interactive_plot_backend():
     backend_name = str(matplotlib.get_backend())
     backend_name_lower = backend_name.lower()
@@ -35,13 +36,14 @@ def ensure_interactive_plot_backend():
         '3D rotation may be unavailable.'
     )
 
+
 def main() -> int | None:
     warnings.filterwarnings('ignore', category=ExperimentalWarning)
     warnings.filterwarnings('ignore', category=UserWarning)
     disable_progress_bar()
 
     ensure_interactive_plot_backend()
-    
+
     with DataDatabase(pathlib.Path.cwd().parent) as db:
         db.try_restore()
         ag_news = db.get_dataset(DatasetID('ag_news'))
@@ -69,15 +71,20 @@ def main() -> int | None:
                 ],
                 bugdets=[500],
                 splits=list(range(10, 300 + 1, 10)),
+                runs=5,
             ),
             # from_product(
             #     active_learning_strategies=[QueryStrategySimple(SimpleQueryStrategyType.LEAST_CONFIDENCE)],
             #     bugdets=[500],
             #     splits=list(range(10, 300 + 1, 10)),
+            #     runs=3,
             # ),
         )
 
-        experiments.sort_by(first=('seed', 'dataset'), last=({'attr': 'split', 'reverse': True},))
+        experiments.sort_by(
+            first=('seed', 'dataset'),
+            last=({'attr': 'split', 'reverse': False}, {'attr': 'active_learning_strategy', 'reverse': True}),
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(
             'google/bert_uncased_L-2_H-128_A-2', cache_dir=pathlib.Path('./cache')
@@ -90,18 +97,27 @@ def main() -> int | None:
 
         tokenizer.encode_plus = MethodType(_encode_plus_adapter, tokenizer)
 
-        runs = 3
-
         @dataclasses.dataclass
         class RunningInfo:
             total: int
+            exps: list[int]
             at: int = 0
             order_at: int = 0
 
-        info = RunningInfo(sum(exp not in db or db.retrieve(exp.get_id()).runs < runs for exp in experiments))
+        info = RunningInfo(
+            sum(
+                exp not in db or db.retrieve(exp.get_id()).runs < experiments[exp][2].expected_runs
+                for exp in experiments
+            ),
+            [
+                experiments[exp][1]
+                for exp in experiments
+                if exp not in db or db.retrieve(exp.get_id()).runs < experiments[exp][2].expected_runs
+            ],
+        )
 
         def update_info(number: int, exp: Experiment, exp_info: Experiments.ExperimentInfo):
-            info.at += 1
+            info.at = info.exps.index(experiments[exp][1]) + 1
             info.order_at = number
 
         def log_run(exp: Experiment, run: int):
@@ -112,15 +128,14 @@ def main() -> int | None:
         experiments.run_all(
             tokenizer,
             'google/bert_uncased_L-2_H-128_A-2',
-            runs,
             db,
             experiment_iteration_callback=update_info,
             run_iteration_callback=log_run,
+            runs_in_depth=False,
         )
 
         db.recollect_stored()
 
-        
         rng = ExperimentsRange(
             experiments,
             ExperimentFilter(
@@ -137,8 +152,8 @@ def main() -> int | None:
                 )
                 & ExperimentInExpression(
                     dataclasses.replace(Experiments.ExperimentKey.empty(), split=split)
-                    for split in list(range(10, 300 + 1, 10))
                     # for split in list(range(10, 50 + 1, 10))
+                    for split in list(range(10, 300 + 1, 10))
                 )
             ),
         )
@@ -160,11 +175,6 @@ def main() -> int | None:
                 ['final_accuracy', 'final_macro_f1'],
                 runs=5,
             ),
-            # ExperimentSelector(
-            #     [BundleAggregator()],
-            #     ["final_accuracy", "final_macro_f1"],
-            #     runs=5,
-            # ),
         )
         groups_for_count = ExperimentGroup.compose_groups(
             rng,
@@ -176,7 +186,7 @@ def main() -> int | None:
                 runs=5,
             ),
         )
-        
+
         # print(groups)
         # print(groups.contained[0].unique_tuples(("seed", "split")))
         printable = groups.to_printable()
@@ -191,7 +201,6 @@ def main() -> int | None:
         splits = set()
         data = {}
 
-        
         for strat_key, inner in printable.items():
             strategy_obj = strat_key[0][1]
             strategy_name = str(strategy_obj)
@@ -218,37 +227,6 @@ def main() -> int | None:
         datasets = sorted(datasets)
         strategies = sorted(strategies)
         splits_sorted = sorted(splits)
-
-        # runs_count = 5
-        # for run_idx in range(runs_count):
-        #     fig, axes = plt.subplots(2, 2, figsize=(12, 10), sharex=True)
-
-        #     for row, metric_name, metric_idx in [(0, "Final Accuracy", 0), (1, "Final Macro F1", 1)]:
-        #         for col, ds in enumerate(datasets):
-        #             ax = axes[row, col]
-        #             for strategy in strategies:
-        #                 y = []
-        #                 for split in splits_sorted:
-        #                     entry = data.get((strategy, ds, split))
-        #                     if entry is not None:
-        #                         acc_per_run, f1_per_run = entry
-        #                         if run_idx < len(acc_per_run):
-        #                             value = acc_per_run[run_idx] if metric_idx == 0 else f1_per_run[run_idx]
-        #                             y.append(value)
-        #                         else:
-        #                             y.append(np.nan)
-        #                     else:
-        #                         y.append(np.nan)
-        #                 ax.plot(splits_sorted, y, marker='o', label=strategy)
-
-        #             ax.set_title(f"{ds} – {metric_name} (Run {run_idx+1})")
-        #             ax.set_xlabel("Split")
-        #             ax.set_ylabel(metric_name)
-        #             ax.legend()
-        #             ax.grid(True)
-
-        #     plt.tight_layout()
-        #     plt.show()
 
         metric_configs = [
             (0, 'Final Accuracy', 0, 2),  # mean at index 0, variance at index 2
@@ -377,6 +355,7 @@ def main() -> int | None:
         if hasattr(fig_3d.canvas.manager, 'set_window_title'):
             fig_3d.canvas.manager.set_window_title('3D Metrics (drag to rotate)')
         plt.show()
+
 
 if __name__ == '__main__':
     raise SystemExit(main())
