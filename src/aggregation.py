@@ -134,7 +134,7 @@ class ExperimentsRange:
         props: Iterable[str],
     ) -> set[tuple]:
         sel = HistorySelector(*props)
-        return {sel.select(next(exp)) for exp in self}
+        return {sel.select(next(iter(exp.sorted_histories))) for exp in self}
 
 
 class ExperimentAggregator(abc.ABC):
@@ -156,6 +156,59 @@ class VarianceAggregator(ExperimentAggregator):
 class BundleAggregator(ExperimentAggregator):
     def aggregate(self, values: Iterable[tuple]) -> tuple:
         return tuple(tuple(vals) for vals in zip(*values))
+
+
+class PlainCountAggregator(ExperimentAggregator):
+    def aggregate(self, values: Iterable[tuple]) -> tuple:
+        return (len(tuple(values)),)
+
+
+class SpreadBundleAggregator(ExperimentAggregator):
+    def __init__(self, count: int):
+        if count <= 0:
+            raise ValueError(f'Count must be integer >= 1, received {count}')
+        self.count = count
+
+    def aggregate(self, values: Iterable[tuple]) -> tuple:
+        for _ in range(self.count):
+            values = itertools.chain.from_iterable(values)
+        return tuple(values)
+
+
+class ComposeAggregator(ExperimentAggregator):
+    def __init__(self, *aggregators: ExperimentAggregator):
+        if len(aggregators) < 2:
+            raise ValueError(f'ComposeAggregator composes mutiple aggrgators, at least 2, not {len(aggregators)}')
+        self.aggregators = tuple(reversed(aggregators))
+
+    def aggregate(self, values: Iterable[tuple]) -> tuple:
+        result = values
+        for agg in self.aggregators:
+            result = agg.aggregate(result)
+        return result
+
+
+class MergeBundleAggregator(ExperimentAggregator):
+    def __init__(self, layers: int):
+        if layers <= 0:
+            raise ValueError(f'Layers must be integer >= 1, received {layers}')
+        self.layers = layers
+
+    def aggregate(self, values: Iterable[tuple]) -> tuple:
+        values = tuple(values)
+        for _ in range(self.layers - 1):
+            values = itertools.chain.from_iterable(values)
+        iterator = iter(values)
+        result = list(next(iterator))
+        for pack in iterator:
+            for i, collection in enumerate(pack):
+                result[i] += collection
+        return tuple(result)
+
+
+class ZipAggregator(ExperimentAggregator):
+    def aggregate(self, values: Iterable[tuple]) -> tuple:
+        return tuple(zip(*values))
 
 
 # TODO: implement max/min, confidence interval aggregators
@@ -207,7 +260,9 @@ class ExperimentSelector(FeatureSelector):
         if self.runs > exp.runs:
             raise ValueError(f'Experiment has only {exp.runs} runs, but {self.runs} were requested for selection.')
         return tuple(
-            aggregator.aggregate(HistorySelector(*properties).select(history) for history in exp.sorted_histories)
+            aggregator.aggregate(
+                HistorySelector(*properties).select(history) for history in exp.sorted_histories[: self.runs]
+            )
             for aggregator, properties in zip(self.aggregators, self.propertiess)
         )
 
@@ -364,7 +419,7 @@ class ExperimentGroup:
     ):
         self.contained = list(collection)
         self.type = type(self.contained[0]) if inner_type is None else inner_type
-        self.aggregators = aggregators
+        self.aggregators = tuple(aggregators)
         if self.type is not experiments.Experiment and selectors:
             raise ValueError('Selectors can only be used for groups of Experiments, not for nested groups.')
         self.selectors = selectors
@@ -422,15 +477,28 @@ class ExperimentGroup:
         )
 
     def to_printable(self):
-        if self.type is not experiments.Experiment and self.group_keys is not None:
-            return {key: subgroup.to_printable() for key, subgroup in zip(self.group_keys, self.contained)}
+        if self.group_keys is not None:
+            if self.type is not experiments.Experiment:
+                return {
+                    key: {
+                        'aggregated': self.aggregate() if self.aggregators else (),
+                        'printable': subgroup.to_printable(),
+                    }
+                    for key, subgroup in zip(self.group_keys, self.contained)
+                }
+            else:
+                return [
+                    {'aggregated': self.aggregate() if self.aggregators else (), 'printable': subgroup.to_printable()}
+                    for subgroup in self.contained
+                ]
 
         return self.aggregate()
 
     def aggregate(self) -> tuple:
         if self.type is experiments.Experiment:
-            return tuple(selector.select(exp) for exp in self.contained for selector in self.selectors)  # type: ignore
-        inner_aggregates = tuple(group.aggregate() for group in self.contained)
+            inner_aggregates = tuple(tuple(selector.select(exp) for exp in self.contained) for selector in self.selectors)  # type: ignore
+        else:
+            inner_aggregates = tuple(group.aggregate() for group in self.contained)
         return (
             tuple(aggregator.aggregate(inner_aggregates) for aggregator in self.aggregators)
             if self.aggregators

@@ -13,7 +13,6 @@ from small_text.integrations.pytorch.query_strategies import BADGE as st_BADGE
 from small_text.query_strategies.bayesian import BALD as st_BALD
 import numpy as np
 import numpy.typing as npt
-import torch
 
 import enum
 from typing import Self

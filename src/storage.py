@@ -254,6 +254,24 @@ class Format(enum.Enum):
         else:
             raise ValueError(f'Unknown format for file: {filename}')
 
+    @staticmethod
+    def id_from_format_name(filename: str) -> ID:
+        match Format.type_from_format_name(filename):
+            case (
+                StorableType.POOL
+                | StorableType.SEEDED_INDICES
+                | StorableType.DATASET
+                | StorableType.DATASETS
+                | StorableType.EXPERIMENT
+                | StorableType.EXPERIMENTS
+                | StorableType.EXPERIMENT_HISTORY
+            ):
+                return filename.rsplit('_', 1)[0]
+            case StorableType.ARRAY:
+                return filename.rsplit('.', 1)[0]
+            case value:
+                raise ValueError(f'Unknown format: {value}')
+
     def switch_format(self, new_entry_type: StorableType) -> 'Format':
         match self:
             case Format.JSON:
