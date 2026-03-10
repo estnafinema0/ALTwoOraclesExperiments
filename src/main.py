@@ -18,12 +18,12 @@ from types import MethodType
 def ensure_interactive_plot_backend():
     backend_name = str(matplotlib.get_backend())
     backend_name_lower = backend_name.lower()
-    needs_gui_backend = backend_name_lower == "agg" or "inline" in backend_name_lower
+    needs_gui_backend = backend_name_lower == 'agg' or 'inline' in backend_name_lower
 
     if not needs_gui_backend:
         return
 
-    for candidate_backend in ("MacOSX", "QtAgg", "TkAgg"):
+    for candidate_backend in ('MacOSX', 'QtAgg', 'TkAgg'):
         try:
             plt.switch_backend(candidate_backend)
             return
@@ -31,8 +31,8 @@ def ensure_interactive_plot_backend():
             continue
 
     print(
-        f"[WARN]: Could not switch matplotlib to a GUI backend (current backend: {backend_name}). "
-        "3D rotation may be unavailable."
+        f'[WARN]: Could not switch matplotlib to a GUI backend (current backend: {backend_name}). '
+        '3D rotation may be unavailable.'
     )
 
 def main() -> int | None:
@@ -90,7 +90,7 @@ def main() -> int | None:
 
         tokenizer.encode_plus = MethodType(_encode_plus_adapter, tokenizer)
 
-        runs = 5
+        runs = 3
 
         @dataclasses.dataclass
         class RunningInfo:
@@ -126,10 +126,10 @@ def main() -> int | None:
             ExperimentFilter(
                 (
                     ExperimentKeyExpression(
-                        dataclasses.replace(Experiments.ExperimentKey.empty(), dataset_id=DatasetID("ag_news"))
+                        dataclasses.replace(Experiments.ExperimentKey.empty(), dataset_id=DatasetID('ag_news'))
                     )
                     | ExperimentKeyExpression(
-                        dataclasses.replace(Experiments.ExperimentKey.empty(), dataset_id=DatasetID("glue", "sst2"))
+                        dataclasses.replace(Experiments.ExperimentKey.empty(), dataset_id=DatasetID('glue', 'sst2'))
                     )
                 )
                 & ExperimentKeyExpression(
@@ -145,7 +145,7 @@ def main() -> int | None:
 
         groups = ExperimentGroup.compose_groups(
             rng,
-            [GroupEqFilter("cold_start_strategy.query_strategy"), GroupEqFilter("dataset.id"), GroupEqFilter("split")],
+            [GroupEqFilter('cold_start_strategy.query_strategy'), GroupEqFilter('dataset.id'), GroupEqFilter('split')],
             [
                 [],
                 [],
@@ -157,7 +157,7 @@ def main() -> int | None:
             ],  # TODO: think about redundant aggregators
             ExperimentSelector(
                 [BundleAggregator()],
-                ["final_accuracy", "final_macro_f1"],
+                ['final_accuracy', 'final_macro_f1'],
                 runs=5,
             ),
             # ExperimentSelector(
@@ -168,11 +168,11 @@ def main() -> int | None:
         )
         groups_for_count = ExperimentGroup.compose_groups(
             rng,
-            [GroupEqFilter("cold_start_strategy.query_strategy"), GroupEqFilter("dataset.id"), GroupEqFilter("split")],
+            [GroupEqFilter('cold_start_strategy.query_strategy'), GroupEqFilter('dataset.id'), GroupEqFilter('split')],
             [[], [], [], [ComposeAggregator(PlainCountAggregator(), SpreadBundleAggregator(3))]],
             ExperimentSelector(
                 [SpreadBundleAggregator(1)],
-                ["uuid"],
+                ['uuid'],
                 runs=5,
             ),
         )
@@ -196,21 +196,21 @@ def main() -> int | None:
             strategy_obj = strat_key[0][1]
             strategy_name = str(strategy_obj)
             strategies.add(strategy_name)
-            ds_dict = inner["printable"]
+            ds_dict = inner['printable']
 
             for ds_key, inner in ds_dict.items():
                 dataset_id = ds_key[0][1]
                 if dataset_id.subset:
-                    ds_name = f"{dataset_id.path}_{dataset_id.subset}"
+                    ds_name = f'{dataset_id.path}_{dataset_id.subset}'
                 else:
                     ds_name = dataset_id.path
                 datasets.add(ds_name)
-                split_dict = inner["printable"]
+                split_dict = inner['printable']
 
                 for split_key, values in split_dict.items():
                     split = split_key[0][1]
                     splits.add(split)
-                    (mean_acc, mean_f1), (var_acc, var_f1), (count,) = values["printable"]
+                    (mean_acc, mean_f1), (var_acc, var_f1), (count,) = values['printable']
                     # acc_per_run, f1_per_run = values[0][0]
                     # data[(strategy_name, ds_name, split)] = (acc_per_run, f1_per_run)
                     data[(strategy_name, ds_name, split)] = (mean_acc, mean_f1, var_acc, var_f1, count)
@@ -251,15 +251,15 @@ def main() -> int | None:
         #     plt.show()
 
         metric_configs = [
-            (0, "Final Accuracy", 0, 2),  # mean at index 0, variance at index 2
-            (1, "Final Macro F1", 1, 3),  # mean at index 1, variance at index 3
+            (0, 'Final Accuracy', 0, 2),  # mean at index 0, variance at index 2
+            (1, 'Final Macro F1', 1, 3),  # mean at index 1, variance at index 3
         ]
         color_cycle = (
-            plt.rcParams["axes.prop_cycle"]
+            plt.rcParams['axes.prop_cycle']
             .by_key()
             .get(
-                "color",
-                ["tab:blue", "tab:orange", "tab:green", "tab:red"],
+                'color',
+                ['tab:blue', 'tab:orange', 'tab:green', 'tab:red'],
             )
         )
         strategy_colors = {strategy: color_cycle[idx % len(color_cycle)] for idx, strategy in enumerate(strategies)}
@@ -284,20 +284,20 @@ def main() -> int | None:
                         splits_sorted,
                         y_mean,
                         yerr=y_std,
-                        marker="o",
+                        marker='o',
                         label=strategy,
                         capsize=3,
                         color=strategy_colors[strategy],
                     )
-                ax.set_title(f"{ds} – {metric_name}")
-                ax.set_xlabel("Split")
+                ax.set_title(f'{ds} – {metric_name}')
+                ax.set_xlabel('Split')
                 ax.set_ylabel(metric_name)
                 ax.legend()
                 ax.grid(True)
 
         plt.tight_layout()
-        if hasattr(fig.canvas.manager, "set_window_title"):
-            fig.canvas.manager.set_window_title("2D Metrics")
+        if hasattr(fig.canvas.manager, 'set_window_title'):
+            fig.canvas.manager.set_window_title('2D Metrics')
         plt.show()
 
         fig_3d = plt.figure(figsize=(8 * len(datasets), 12))
@@ -305,8 +305,8 @@ def main() -> int | None:
         for row, metric_name, metric_idx, var_idx in metric_configs:
             for col, ds in enumerate(datasets):
                 subplot_index = row * len(datasets) + col + 1
-                ax = fig_3d.add_subplot(2, len(datasets), subplot_index, projection="3d")
-                ax.set_proj_type("persp")
+                ax = fig_3d.add_subplot(2, len(datasets), subplot_index, projection='3d')
+                ax.set_proj_type('persp')
 
                 for strategy_idx, strategy in enumerate(strategies):
                     z_mean = []
@@ -336,9 +336,9 @@ def main() -> int | None:
                     upper = z_mean_valid + z_std_valid
                     color = strategy_colors[strategy]
 
-                    ax.plot(x_valid, y_valid, z_mean_valid, marker="o", color=color, linewidth=2)
-                    ax.plot(x_valid, y_valid, lower, color=color, alpha=0.6, linewidth=1.1, linestyle="--")
-                    ax.plot(x_valid, y_valid, upper, color=color, alpha=0.6, linewidth=1.1, linestyle="--")
+                    ax.plot(x_valid, y_valid, z_mean_valid, marker='o', color=color, linewidth=2)
+                    ax.plot(x_valid, y_valid, lower, color=color, alpha=0.6, linewidth=1.1, linestyle='--')
+                    ax.plot(x_valid, y_valid, upper, color=color, alpha=0.6, linewidth=1.1, linestyle='--')
 
                     for x_value, lower_value, upper_value in zip(x_valid, lower, upper):
                         ax.plot(
@@ -364,9 +364,9 @@ def main() -> int | None:
                         )
                     )
 
-                ax.set_title(f"{ds} – {metric_name} (3D)")
-                ax.set_xlabel("Split")
-                ax.set_ylabel("Strategy")
+                ax.set_title(f'{ds} – {metric_name} (3D)')
+                ax.set_xlabel('Split')
+                ax.set_ylabel('Strategy')
                 ax.set_zlabel(metric_name)
                 ax.set_yticks(np.arange(len(strategies)))
                 ax.set_yticklabels(strategies)
@@ -374,8 +374,8 @@ def main() -> int | None:
                 ax.grid(True)
 
         plt.tight_layout()
-        if hasattr(fig_3d.canvas.manager, "set_window_title"):
-            fig_3d.canvas.manager.set_window_title("3D Metrics (drag to rotate)")
+        if hasattr(fig_3d.canvas.manager, 'set_window_title'):
+            fig_3d.canvas.manager.set_window_title('3D Metrics (drag to rotate)')
         plt.show()
 
 if __name__ == '__main__':

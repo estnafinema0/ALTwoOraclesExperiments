@@ -175,6 +175,16 @@ class Experiment(Storable):
     @property
     def sorted_histories(self) -> list[ExperimentHistory]:
         return [h[1] for h in sorted(self.histories.items(), key=lambda p: p[0])[: self.runs]]
+    
+    def remove_history_run(self, run_number):
+        if run_number not in self.histories:
+            raise ValueError(f'No such history that has run number {run_number}')
+        runs = self.runs
+        del self.histories[run_number]
+        for i in range(run_number + 1, runs + 1):
+            self.histories[i - 1] = self.histories[i]
+        if run_number != runs:
+            del self.histories[runs]
 
     @staticmethod
     def _get_salt(
