@@ -4,9 +4,10 @@ import numpy as np
 import numpy.typing as npt
 
 import dataclasses
+import itertools
 import enum
 from abc import ABC, abstractmethod
-from typing import Self, Callable
+from typing import Self, Callable, Iterable
 import hashlib
 import pathlib
 import weakref
@@ -28,6 +29,7 @@ class StorableType(enum.StrEnum):
     POOL = enum.auto()
     DATASET = enum.auto()
     DATASETS = enum.auto()
+    ARRAY_WRAPPER = enum.auto()
 
     def is_groupable(self) -> bool:
         return self not in (StorableType.ARRAY, StorableType.EXPERIMENTS, StorableType.DATASETS)
@@ -44,7 +46,11 @@ class StorableEntry:
         return StorableEntry(payload={'array': arr}, type=StorableType.ARRAY, id=id)
 
     def get_references(self) -> set[ID]:
-        match self.type:
+        return set(map(lambda x: x[0], self.get_references_from_pythonish(self.type, self.payload)))
+
+    @staticmethod
+    def get_references_from_pythonish(entry_type: StorableType, payload: dict) -> Iterable[tuple[ID, StorableType]]:
+        match entry_type:
             case t if t in (
                 StorableType.ARRAY,
                 StorableType.DATASET,
@@ -53,15 +59,20 @@ class StorableEntry:
             ):
                 return set()
             case StorableType.LLM_LABELS:
-                return {self.payload['labels']}
+                return {(payload['labels'], StorableType.ARRAY)}
             case StorableType.POOL:
-                return {self.payload['dataset_id'], self.payload['indices']}
+                return {
+                    (payload['dataset_id'], StorableType.DATASET),
+                    (payload['indices'], StorableType.SEEDED_INDICES),
+                }
             case StorableType.DATASETS:
-                return set(self.payload['datasets'].values())
+                return set(zip(payload['datasets'].values(), itertools.repeat(StorableType.DATASET)))
             case StorableType.EXPERIMENT:
-                return {self.payload['dataset'], self.payload['pool']} | set(self.payload['histories'].values())
+                return {(payload['dataset'], StorableType.DATASET), (payload['pool'], StorableType.POOL)} | set(
+                    zip(payload['histories'].values(), itertools.repeat(StorableType.EXPERIMENT_HISTORY))
+                )
             case StorableType.EXPERIMENTS:
-                return set(self.payload['experiments'])
+                return set(zip(payload['experiments'], itertools.repeat(StorableType.EXPERIMENT)))
             case _:
                 assert False, 'unreachable'
 
@@ -259,7 +270,6 @@ class Format(enum.Enum):
         match Format.type_from_format_name(filename):
             case (
                 StorableType.POOL
-                | StorableType.SEEDED_INDICES
                 | StorableType.DATASET
                 | StorableType.DATASETS
                 | StorableType.EXPERIMENT
@@ -267,6 +277,8 @@ class Format(enum.Enum):
                 | StorableType.EXPERIMENT_HISTORY
             ):
                 return filename.rsplit('_', 1)[0]
+            case StorableType.SEEDED_INDICES:
+                return filename.rsplit('_', 2)[0]
             case StorableType.ARRAY:
                 return filename.rsplit('.', 1)[0]
             case value:

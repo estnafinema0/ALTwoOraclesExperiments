@@ -44,15 +44,21 @@ def main() -> int | None:
 
     ensure_interactive_plot_backend()
 
+    # with DataDatabase(pathlib.Path.cwd().parent) as db:
+    #     # db.try_restore()
+    #     # db.recollect_stored()
+    #     db.unroll()
+
+    # return
+
     with DataDatabase(pathlib.Path.cwd().parent) as db:
         db.try_restore()
-        ag_news = db.get_dataset(DatasetID('ag_news'))
-        sst_2 = db.get_dataset(DatasetID('glue', 'sst2'), text_field='sentence')
+        ag_news = db.get_dataset(DatasetID('ag_news'), cache=True)
+        sst_2 = db.get_dataset(DatasetID('glue', 'sst2'), text_field='sentence', cache=True)
 
         from_product = Experiments.from_product(
             database=db,
             datasets=[ag_news, sst_2],
-            # seeds=[42], #, 69, 1337, 1147, 1984],
             seeds=[42, 69, 1337, 1147, 1984],
             pool_size=1000,
             cold_start_strategies=[
@@ -66,29 +72,25 @@ def main() -> int | None:
 
         experiments = Experiments.from_experiments(
             from_product(
-                active_learning_strategies=[
-                    MockQueryStrategyType(),
-                ],
+                active_learning_strategies=[MockQueryStrategyType()],
                 bugdets=[500],
                 splits=list(range(10, 300 + 1, 10)),
                 runs=5,
             ),
-            # from_product(
-            #     active_learning_strategies=[QueryStrategySimple(SimpleQueryStrategyType.LEAST_CONFIDENCE)],
-            #     bugdets=[500],
-            #     splits=list(range(10, 300 + 1, 10)),
-            #     runs=3,
-            # ),
+            from_product(
+                active_learning_strategies=[QueryStrategySimple(SimpleQueryStrategyType.LEAST_CONFIDENCE)],
+                bugdets=[500],
+                splits=list(range(10, 300 + 1, 10)),
+                runs=3,
+            ),
         )
 
         experiments.sort_by(
             first=('seed', 'dataset'),
-            last=({'attr': 'split', 'reverse': False}, {'attr': 'active_learning_strategy', 'reverse': True}),
+            last=({'attr': 'split', 'reverse': True}, {'attr': 'active_learning_strategy', 'reverse': True}),
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            'google/bert_uncased_L-2_H-128_A-2', cache_dir=pathlib.Path('./cache')
-        )
+        tokenizer = AutoTokenizer.from_pretrained('google/bert_uncased_L-2_H-128_A-2')
 
         def _encode_plus_adapter(self, text, text_pair=None, **kwargs):
             if text_pair is not None:
@@ -176,16 +178,6 @@ def main() -> int | None:
                 runs=5,
             ),
         )
-        groups_for_count = ExperimentGroup.compose_groups(
-            rng,
-            [GroupEqFilter('cold_start_strategy.query_strategy'), GroupEqFilter('dataset.id'), GroupEqFilter('split')],
-            [[], [], [], [ComposeAggregator(PlainCountAggregator(), SpreadBundleAggregator(3))]],
-            ExperimentSelector(
-                [SpreadBundleAggregator(1)],
-                ['uuid'],
-                runs=5,
-            ),
-        )
 
         # print(groups)
         # print(groups.contained[0].unique_tuples(("seed", "split")))
@@ -220,8 +212,6 @@ def main() -> int | None:
                     split = split_key[0][1]
                     splits.add(split)
                     (mean_acc, mean_f1), (var_acc, var_f1), (count,) = values['printable']
-                    # acc_per_run, f1_per_run = values[0][0]
-                    # data[(strategy_name, ds_name, split)] = (acc_per_run, f1_per_run)
                     data[(strategy_name, ds_name, split)] = (mean_acc, mean_f1, var_acc, var_f1, count)
 
         datasets = sorted(datasets)

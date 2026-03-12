@@ -15,7 +15,7 @@ import numpy as np
 import numpy.typing as npt
 
 import enum
-from typing import Self
+from typing import Self, Any
 import dataclasses
 import datetime
 from abc import abstractmethod
@@ -39,7 +39,7 @@ def evaluate_on_test(
 
 class QueryStrategyType(Stringifiable):
     @abstractmethod
-    def get_parameters(self) -> dict[str, any]:
+    def get_parameters(self) -> dict[str, Any]:
         pass
 
     @abstractmethod
@@ -153,7 +153,7 @@ class QueryStrategySimple(QueryStrategyType, Stringifiable):
         super().__init__()
         self.__strategy = simple_strategy
 
-    def get_parameters(self) -> dict[str, any]:
+    def get_parameters(self) -> dict[str, Any]:
         return {}
 
     def query_strategy_name(self) -> str:
@@ -200,7 +200,7 @@ class QueryStrategySimple(QueryStrategyType, Stringifiable):
 
 @Stringifiable.make_stringifiable()
 class MockQueryStrategyType(QueryStrategyType, Stringifiable):
-    def get_parameters(self) -> dict[str, any]:
+    def get_parameters(self) -> dict[str, Any]:
         return {}
 
     def query_strategy_name(self) -> str:

@@ -571,7 +571,7 @@ class Experiments(Storable):
 
         if runs_in_depth:
             for i, experiment in enumerate(self.experiments):
-                experiment_info = self.__experiments_map[experiment][2]
+                experiment_info = self.__experiments_map[Experiments.ExperimentKey.from_experiment(experiment)][2]
                 force = default_force if experiment_info.force is None else experiment_info.force
                 exp_runs: int = experiment_info.expected_runs if runs is None else runs
                 exp: Experiment = database.get_experiment(
@@ -605,7 +605,7 @@ class Experiments(Storable):
             )
             for current_runs in range(1, max_runs):
                 for i, experiment in enumerate(self.experiments):
-                    experiment_info = self.__experiments_map[experiment][2]
+                    experiment_info = self.__experiments_map[Experiments.ExperimentKey.from_experiment(experiment)][2]
                     force = default_force if experiment_info.force is None else experiment_info.force
                     exp_runs: int = min(experiment_info.expected_runs if runs is None else runs, current_runs)
                     exp: Experiment = database.get_experiment(
@@ -730,8 +730,8 @@ class Experiments(Storable):
         )
         self.experiments.sort(key=key_func)
         for i, exp in enumerate(self.experiments):
-            self.__experiments_map[exp] = (
+            self.__experiments_map[Experiments.ExperimentKey.from_experiment(exp)] = (
                 exp,
                 i,
-                self.__experiments_map[exp][2],
+                self.__experiments_map[Experiments.ExperimentKey.from_experiment(exp)][2],
             )

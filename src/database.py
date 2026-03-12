@@ -128,18 +128,20 @@ class LLMLabels(storage.Storable):  # TODO: consider pool mapping
 
     def as_storable(self) -> storage.StorableBundle:
         salt = self._get_salt(self.dataset_id, self.llm)
-        array_id = f'{salt}_1#{hash((salt, 1))}'
+        array_id = f'{salt}_1#{storage.Storable.combine_hashes(*map(storage.Storable.hash_str, (salt, '1')))}'
+        array_wrapper = ArrayWrapper(None, array_id, self.labels)
         return storage.StorableBundle(
             main=self.get_id(),
             entries={
                 self.get_id(): storage.StorableEntry(
                     payload={
                         'llm': str(self.llm),
-                        'labels': array_id,
+                        'labels': array_wrapper.get_id(),
                     },
                     type=storage.StorableType.LLM_LABELS,
                 ),
-                array_id: storage.StorableEntry.from_npy(self.labels),
+                **array_wrapper.as_storable().entries,
+                # array_id: storage.StorableEntry.from_npy(self.labels),
             },
         )
 
@@ -153,7 +155,7 @@ class LLMLabels(storage.Storable):  # TODO: consider pool mapping
         obj = LLMLabels(
             dataset_id=DatasetID.from_str(payload['dataset_id']),
             llm=LLMType.from_str(payload['llm']),
-            labels=data.retrieve(payload['labels']).payload['array'],
+            labels=data.retrieve(payload['labels']).array,
         )
         data.encache(obj)
         return obj
@@ -352,7 +354,14 @@ class Pool(storage.Storable):
 @storage.Storable.make_storable(storage.StorableType.DATASET)
 class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
     def __init__(
-        self, id: DatasetID, text_field: str, label_field: str, database: 'DataDatabase', train_len: None | int = None
+        self,
+        id: DatasetID,
+        text_field: str,
+        label_field: str,
+        database: 'DataDatabase',
+        *,
+        train_len: None | int = None,
+        cache_on_disk: bool = False,
     ):
         self.id = id
         self.text_field = text_field
@@ -363,6 +372,7 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
         self.__validation = None
         self.__database = database
         self.__train_len = train_len
+        self.cache_on_disk = cache_on_disk
 
     @property
     def annotations(self) -> dict[LLMType, LLMLabels]:  # TODO: pass storage object
@@ -408,12 +418,29 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
     def internal(self) -> datasets.DatasetDict:
         if self.__dataset is not None:
             return self.__dataset
+        force = False
+        try:
+            if self.cache_on_disk and self.__cached_on_disk:
+                self.__dataset = datasets.DatasetDict.load_from_disk(self.__dataset_dir)
+                return self.__dataset
+        except FileNotFoundError:
+            force = True
         if self.id.subset is None:
             self.__dataset = datasets.load_dataset(self.id.path)
         else:
             self.__dataset = datasets.load_dataset(self.id.path, self.id.subset)
         self.__dataset = self.__standardize_dataset(self.__dataset)
+        if self.cache_on_disk and (not self.__cached_on_disk or force):
+            self.__dataset.save_to_disk(self.__dataset_dir)
         return self.__dataset
+
+    @property
+    def __cached_on_disk(self) -> bool:
+        return self.__dataset_dir.exists()
+
+    @property
+    def __dataset_dir(self) -> pathlib.Path:
+        return self.__database.root_dir / storage.DATA_DIR / 'bin' / 'datasets' / f'{self.get_id()}/'
 
     def pool(self, indices: Indices) -> Pool:
         id = Pool.make_id(self.id, indices.get_id())
@@ -544,6 +571,56 @@ class Datasets(storage.Storable):
             return data.retrieve(entry.id)
         payload = entry.payload
         obj = Datasets(data.retrieve(dataset_entry_id) for dataset_entry_id in payload['datasets'].values())
+        data.encache(obj)
+        return obj
+
+
+@storage.Storable.make_storable(storage.StorableType.ARRAY_WRAPPER)
+class ArrayWrapper(storage.Storable):
+    def __init__(self, database: 'DataDatabase', arr_id: storage.ID, arr: npt.NDArray | None = None):
+        self.id = arr_id
+        self.db = database
+        self.__array = arr
+
+    @property
+    def array(self) -> npt.NDArray:
+        if self.__array is None:
+            self.__array = self.__load()
+        return self.__array
+
+    def __load(self):
+        path = self.db.root_dir / storage.DATA_DIR / pathlib.Path(self.db.stored_index[self.id].obj.payload['rel_path'])
+        return storage.Formatter.load(storage.Format.NPZ, path).payload['array']
+
+    def _get_salt(self) -> storage.Hash:
+        return storage.Storable.hash_str(self.id)
+
+    def get_id(self) -> storage.ID:
+        return self.id
+
+    def as_storable(self) -> storage.StorableBundle:
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): storage.StorableEntry(
+                    payload={
+                        'rel_path': str(
+                            pathlib.Path('bin/') / storage.Format.NPZ.format_name(self.id, storage.StorableType.ARRAY)
+                        )
+                    },
+                    type=storage.StorableType.ARRAY_WRAPPER,
+                    id=self.get_id(),
+                ),
+            },
+        )
+
+    @staticmethod
+    def from_storable(
+        entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
+    ) -> 'Datasets':
+        if entry.id in data and storable_type != storage.StorableType.ARRAY_WRAPPER:
+            return data.retrieve(entry.id)
+        obj = ArrayWrapper(data, entry.id)
         data.encache(obj)
         return obj
 
@@ -803,8 +880,10 @@ class DataDatabase:
         match entry_type:
             case storage.StorableType.ARRAY:
                 return pathlib.Path('bin')
-            case storage.StorableType.POOL | storage.StorableType.SEEDED_INDICES:
-                return pathlib.Path('markup')
+            case storage.StorableType.POOL:
+                return pathlib.Path('markup', 'pools')
+            case storage.StorableType.SEEDED_INDICES:
+                return pathlib.Path('markup', 'indices')
             case storage.StorableType.EXPERIMENT_HISTORY:
                 return pathlib.Path('experiments', 'histories')
             case storage.StorableType.DATASET:
@@ -950,64 +1029,106 @@ class DataDatabase:
         self.__walk_local_storage(warn_unindexed)
 
     def try_restore(self):
+        def completely_storable(obj: storage.StorableEntry) -> bool:
+            # if obj.type == storage.StorableType.EXPERIMENT:
+            #     assert False, "TODO: remove histories that are missing"
+            for ref_id in obj.get_references():
+                if ref_id not in self:
+                    return False
+            return True
+
         def process_file(folder: pathlib.Path, file: pathlib.Path):
             stored_id = storage.Format.id_from_format_name(file.name)
             loaded = self.__load_from_disk_by_path(stored_id, self.root_dir / storage.DATA_DIR / file)
-            if stored_id not in self.stored_index and stored_id not in self.objects_store:
+
+            is_encached = stored_id in self.objects_store
+            is_stored = stored_id in self.stored_index
+
+            stored_entry = None if not is_stored else self.stored_index[stored_id].obj
+            was = None if not is_encached else self.objects_store[stored_id]
+
+            if not is_stored and not is_encached:
+                if not completely_storable(loaded.obj):
+                    ref_id = next(ref_id for ref_id in loaded.obj.get_references() if ref_id not in self)
+                    print(
+                        f'[ERROR]: Failed to load {file}, because referenced id {ref_id} is missing. Loaded: {loaded.obj}'
+                    )
+                    return
                 self.add_to_store_index(loaded.obj)
-            elif stored_id not in self.stored_index and stored_id in self.objects_store:
+            elif not is_stored and is_encached:
                 print(f'[WARNING]: unindexed stored file: {file} that was recreated: {stored_id}')
-                was = self.objects_store[stored_id]
                 bundle = was.as_storable()
                 entry = bundle.entries[bundle.main]
-                merged = DataDatabase.merge_storables(entry, loaded.obj)
-                self.destroy(merged.id, inconsistent_ok=True)
-                self.add_to_store_index(merged)
-            elif stored_id not in self.objects_store:
-                if self.storables_differ(self.stored_index[stored_id].obj, loaded.obj):
-                    merged = DataDatabase.merge_storables(loaded.obj, self.stored_index[stored_id].obj)
-                    self.add_to_store_index(merged, force=True)
-                else:
-                    if not self.stored_index[stored_id].stored_on_disk:
-                        print(f'[WARNING]: Consistent stored on disk file: {file}. Marking as stored on disk')
-                        self.stored_index[stored_id].stored = True
-                        self.stored_index[stored_id].format = storage.Format.format_from_format_name(file.name)
-            else:
-                bundle = self.objects_store[stored_id].as_storable()
-                entry = bundle.entries[bundle.main]
-                assert not self.storables_differ(self.stored_index[stored_id].obj, entry)
-                if self.storables_differ(self.stored_index[stored_id].obj, loaded.obj):
+                try:
+                    merged = DataDatabase.merge_storables(entry, loaded.obj)
+                except ValueError:
+                    print(f'[ERROR]: Failed to merge id {entry.id} loaded {loaded.obj} with encached {stored_entry}. Trying to merge with encached preference...')
+                    merged = DataDatabase.__try_merge_storables(entry, loaded.obj)
+                if not completely_storable(merged):
+                    print(f'[ERROR]: Failed to add merged id {merged.id} entry {merged} when merging with {entry}. Skipping...')
+                    return
+                self.destroy(merged.id)
+                self.__recreate(merged)
+            elif is_stored and not is_encached:
+                if self.storables_differ(stored_entry, loaded.obj):
                     try:
-                        merged = DataDatabase.merge_storables(loaded.obj, self.stored_index[stored_id].obj)
-                    except ValueError as e:
-                        print(
-                            f'[WARNING]: `{e}`. Preferring live object, merging into it. Live: {self.stored_index[stored_id].obj}, loaded: {loaded.obj}',
-                            end='',
-                        )
-                        merged = DataDatabase.__try_merge_storables(self.stored_index[stored_id].obj, loaded.obj)
-                        print(f', merged: {merged.payload}')
-                    self.destroy(merged.id, inconsistent_ok=True)
+                        merged = DataDatabase.merge_storables(loaded.obj, stored_entry)
+                    except ValueError:
+                        print(f'[ERROR]: Failed to merge id {stored_entry.id} loaded {loaded.obj} with stored {stored_entry}. Trying to merge with stored preference...')
+                        merged = DataDatabase.__try_merge_storables(stored_entry, loaded.obj)
+                    if not completely_storable(merged):
+                        print(f'[ERROR]: Failed to add merged id {merged.id} entry {merged} when merging with {stored_entry}. Skipping...')
+                        return
+                    self.add_to_store_index(merged, force=True)
+                elif not self.stored_index[stored_id].stored_on_disk:
+                    print(f'[WARNING]: Consistent stored on disk file: {file}. Marking as stored on disk')
+                    self.stored_index[stored_id].stored = True
+                    self.stored_index[stored_id].format = storage.Format.format_from_format_name(file.name)
+            elif is_stored and is_encached:
+                bundle = was.as_storable()
+                entry = bundle.entries[bundle.main]
+                assert not self.storables_differ(entry, stored_entry)
+                if self.storables_differ(stored_entry, loaded.obj):
+                    try:
+                        merged = DataDatabase.merge_storables(stored_entry, loaded.obj)
+                    except ValueError:
+                        print(f'[ERROR]: Failed to merge id {stored_entry.id} loaded {loaded.obj} with stored {stored_entry}. Trying to merge with in db preference...')
+                        merged = DataDatabase.__try_merge_storables(stored_entry, loaded.obj)
+                    if not completely_storable(merged):
+                        print(f'[ERROR]: Failed to add merged id {merged.id} entry {merged} when merging with {stored_entry}. Skipping...')
+                        return
+                    self.destroy(merged.id)
                     self.add_to_store_index(merged, force=True)
                     if not self.stored_index[stored_id].stored_on_disk:
                         self.__store_entry(
-                            self.stored_index[stored_id].obj, self.stored_index[stored_id].format or storage.Format.JSON
+                            self.stored_index[stored_id].obj,
+                            self.stored_index[stored_id].format or storage.Format.JSON,
                         )
-                else:
-                    if not self.stored_index[stored_id].stored_on_disk:
-                        print(f'[WARNING]: Consistent stored on disk file: {file}. Marking as stored on disk')
-                        self.stored_index[stored_id].stored = True
-                        self.stored_index[stored_id].format = storage.Format.format_from_format_name(file.name)
+                elif not self.stored_index[stored_id].stored_on_disk:
+                    print(f'[WARNING]: Consistent stored on disk file: {file}. Marking as stored on disk')
+                    self.stored_index[stored_id].stored = True
+                    self.stored_index[stored_id].format = storage.Format.format_from_format_name(file.name)
+            else:
+                assert False, 'unreachable'
 
         self.__walk_local_storage(process_file)
+
+    def unroll(self):
+        for obj in self.objects_store.values():
+            if obj.get_id() not in self.stored_index:
+                self.add_to_store_index(obj.as_storable())
+        for stored_entry in self.stored_index.values():
+            if not stored_entry.stored_on_disk:
+                self.__store_entry(stored_entry.obj, storage.Format.JSON)
 
     def __walk_local_storage(self, callback: Callable[[pathlib.Path, pathlib.Path], None]):
         data_folder = self.root_dir / storage.DATA_DIR
         for folder in (
             data_folder / 'datasets',
+            data_folder / 'markup' / 'indices',
+            data_folder / 'markup' / 'pools',
             data_folder / 'experiments' / 'histories',
             data_folder / 'experiments',
-            data_folder / 'markup',
-            data_folder / 'bin',
             data_folder,
         ):
             if not folder.exists():
@@ -1027,14 +1148,18 @@ class DataDatabase:
             return obj in self.datasets
         return NotImplemented
 
-    def get_dataset(self, obj: DatasetID, text_field: str = 'text', label_field: str = 'label') -> CompleteDataset:
+    def get_dataset(
+        self, obj: DatasetID, text_field: str = 'text', label_field: str = 'label', cache: bool = False
+    ) -> CompleteDataset:
         if obj in self.datasets:
+            self.datasets.datasets[obj].cache_on_disk = cache
             return self.datasets.datasets[obj]
         dataset = CompleteDataset(
             id=obj,
             text_field=text_field,
             label_field=label_field,
             database=self,
+            cache_on_disk=cache,
         )
         self.encache(dataset)
 
@@ -1108,6 +1233,14 @@ class DataDatabase:
 
     def __load_config(self, config: dict):
         for obj_id, obj in config['objects'].items():
+            if (
+                storage.StorableType(obj['type']) == storage.StorableType.EXPERIMENT
+                and obj_id not in config['experiments']
+            ):
+                config['experiments'].append(obj_id)
+
+        dead_ids: deque[tuple[str, storage.StorableType]] = deque()
+        for obj_id, obj in config['objects'].items():
             self.stored_index[obj_id] = storage.StoredEntry(
                 obj=storage.StorableEntry(
                     payload=obj['payload'],
@@ -1117,7 +1250,12 @@ class DataDatabase:
                 stored=False,
                 format=None,
             )
-        dead_ids = deque()
+            for ref_id, ref_type in storage.StorableEntry.get_references_from_pythonish(
+                storage.StorableType(obj['type']), obj['payload']
+            ):
+                if not any(ref_id in config[value] for value in ['objects', 'refs', 'datasets']):
+                    dead_ids.append((ref_id, ref_type))
+
         for obj_id in config['refs']:
             try:
                 self.stored_index[obj_id] = self.__load_from_disk(
@@ -1216,14 +1354,15 @@ class DataDatabase:
                         if run_number != runs:
                             del entry.obj.payload['histories'][str(runs)]
                         entry.obj.payload['runs'] -= 1
-                        path = (
-                            self.root_dir
-                            / storage.DATA_DIR
-                            / self.__get_rel_directory(entry.obj.type)
-                            / entry.format.format_name(entry.obj.id, entry.obj.type)
-                        )
-                        print(f'[WARNING]: Updating stored file {path} with cutted version')
-                        self.__store_entry(entry.obj, entry.format, update_index=False)
+                        if entry.stored_on_disk:
+                            path = (
+                                self.root_dir
+                                / storage.DATA_DIR
+                                / self.__get_rel_directory(entry.obj.type)
+                                / entry.format.format_name(entry.obj.id, entry.obj.type)
+                            )
+                            print(f'[WARNING]: Updating stored file {path} with cutted version')
+                            self.__store_entry(entry.obj, entry.format, update_index=False)
                     else:
                         print(
                             f'[WARNING]: incomplete object {stored_id} removing from stored index. Content: {entry.obj}'
