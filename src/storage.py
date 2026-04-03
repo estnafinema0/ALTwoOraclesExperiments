@@ -30,6 +30,9 @@ class StorableType(enum.StrEnum):
     DATASET = enum.auto()
     DATASETS = enum.auto()
     ARRAY_WRAPPER = enum.auto()
+    LLM_INDEX_RECAP_EXAMPLES = enum.auto()
+    DIVERSITY_BASED_K_MEANS_CLUSTERS = enum.auto()
+    LLM_CLUSTER_EXAMPLES = enum.auto()
 
     def is_groupable(self) -> bool:
         return self not in (StorableType.ARRAY, StorableType.EXPERIMENTS, StorableType.DATASETS)
@@ -53,13 +56,14 @@ class StorableEntry:
         match entry_type:
             case t if t in (
                 StorableType.ARRAY,
+                StorableType.ARRAY_WRAPPER,
                 StorableType.DATASET,
                 StorableType.SEEDED_INDICES,
                 StorableType.EXPERIMENT_HISTORY,
             ):
                 return set()
             case StorableType.LLM_LABELS:
-                return {(payload['labels'], StorableType.ARRAY)}
+                return [(payload['labels'], StorableType.ARRAY)]
             case StorableType.POOL:
                 return {
                     (payload['dataset_id'], StorableType.DATASET),
@@ -73,6 +77,12 @@ class StorableEntry:
                 )
             case StorableType.EXPERIMENTS:
                 return set(zip(payload['experiments'], itertools.repeat(StorableType.EXPERIMENT)))
+            case (
+                StorableType.LLM_INDEX_RECAP_EXAMPLES
+                | StorableType.LLM_CLUSTER_EXAMPLES
+                | StorableType.DIVERSITY_BASED_K_MEANS_CLUSTERS
+            ):
+                return [(payload['subset'], StorableType.ARRAY_WRAPPER)]
             case _:
                 assert False, 'unreachable'
 
@@ -169,16 +179,16 @@ class Stringifiable(ABC):
 
     @staticmethod
     @abstractmethod
-    def from_str(s: str) -> Self:
+    def from_str(s: str, db: 'database.DataDatabase') -> Self:
         pass
 
     @staticmethod
-    def restore(s: str) -> 'Stringifiable':
+    def restore(s: str, db: 'database.DataDatabase') -> 'Stringifiable':
         if s not in Stringifiable.stringifiebles:
             raise ValueError(f'Unkown stringifiable, unregistered: {s}')
-        for cls in Stringifiable.stringifiebles[s]:
+        for cls in Stringifiable.stringifiebles:
             try:
-                return cls.from_str(s)
+                return cls.from_str(s, db)
             except ValueError:
                 continue
         raise ValueError(f'Unkown stringifiable, no class could parse: {s}')
@@ -208,6 +218,8 @@ class Format(enum.Enum):
                 match entry_type:
                     case StorableType.ARRAY:
                         raise ValueError('ARRAY type cannot be stored in JSON format')
+                    case StorableType.ARRAY_WRAPPER:
+                        return f'{id}_array_wrapper.json'
                     case StorableType.POOL:
                         return f'{id}_pool.json'
                     case StorableType.SEEDED_INDICES:
@@ -224,6 +236,12 @@ class Format(enum.Enum):
                         return f'{id}_experiments.json'
                     case StorableType.EXPERIMENT_HISTORY:
                         return f'{id}_hist.json'
+                    case StorableType.LLM_INDEX_RECAP_EXAMPLES:
+                        return f'{id}_llm_index_recap_examples.json'
+                    case StorableType.LLM_CLUSTER_EXAMPLES:
+                        return f'{id}_llm_cluster_examples.json'
+                    case StorableType.DIVERSITY_BASED_K_MEANS_CLUSTERS:
+                        return f'{id}_llm_diversity_based_k_means_clusters.json'
                     case _:
                         raise NotImplementedError(f'JSON format not implemented for {entry_type} type')
             case Format.NPZ:
@@ -246,20 +264,29 @@ class Format(enum.Enum):
 
     @staticmethod
     def type_from_format_name(filename: str) -> StorableType:
-        if filename.endswith('_pool.json'):
+        COMMON_CONFIG_EXTENSION = ['.json']
+
+        def is_of_format(filename: str, base_postfix: str) -> bool:
+            return any(filename.endswith(f'{base_postfix}{extension}') for extension in COMMON_CONFIG_EXTENSION)
+
+        if is_of_format(filename, '_pool'):
             return StorableType.POOL
-        elif filename.endswith('_seeded_indices.json'):
+        elif is_of_format(filename, '_seeded_indices'):
             return StorableType.SEEDED_INDICES
-        elif filename.endswith('_dataset.json'):
+        elif is_of_format(filename, '_dataset'):
             return StorableType.DATASET
-        elif filename.endswith('_datasets.json'):
+        elif is_of_format(filename, '_datasets'):
             return StorableType.DATASETS
-        elif filename.endswith('_experiment.json'):
+        elif is_of_format(filename, '_experiment'):
             return StorableType.EXPERIMENT
-        elif filename.endswith('_experiments.json'):
+        elif is_of_format(filename, '_experiments'):
             return StorableType.EXPERIMENTS
-        elif filename.endswith('_hist.json'):
+        elif is_of_format(filename, '_hist'):
             return StorableType.EXPERIMENT_HISTORY
+        elif is_of_format(filename, '_llm_index_recap_examples'):
+            return StorableType.LLM_INDEX_RECAP_EXAMPLES
+        elif is_of_format(filename, '_array_wrapper'):
+            return StorableType.ARRAY_WRAPPER
         elif filename.endswith('.npz'):
             return StorableType.ARRAY
         else:
@@ -277,8 +304,10 @@ class Format(enum.Enum):
                 | StorableType.EXPERIMENT_HISTORY
             ):
                 return filename.rsplit('_', 1)[0]
-            case StorableType.SEEDED_INDICES:
+            case StorableType.SEEDED_INDICES | StorableType.ARRAY_WRAPPER:
                 return filename.rsplit('_', 2)[0]
+            case StorableType.LLM_INDEX_RECAP_EXAMPLES:
+                return filename.rsplit('_', 4)[0]
             case StorableType.ARRAY:
                 return filename.rsplit('.', 1)[0]
             case value:
@@ -299,6 +328,8 @@ class Format(enum.Enum):
                         | StorableType.EXPERIMENT
                         | StorableType.EXPERIMENTS
                         | StorableType.EXPERIMENT_HISTORY
+                        | StorableType.LLM_INDEX_RECAP_EXAMPLES
+                        | StorableType.ARRAY_WRAPPER
                     ):
                         return Format.JSON
                     case _:
@@ -330,7 +361,7 @@ class Formatter:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         match format:
             case Format.NPZ:
-                np.savez_compressed(filepath, obj.payload['array'])
+                np.savez_compressed(filepath, arr=obj.payload['array'])
             case Format.JSON:
                 json.dump(
                     {
@@ -349,7 +380,7 @@ class Formatter:
         match format:
             case Format.NPZ:
                 return StorableEntry(
-                    payload={'array': np.load(filepath)},
+                    payload={'array': np.load(filepath)['arr']},
                     type=StorableType.ARRAY,
                     id='',
                 )

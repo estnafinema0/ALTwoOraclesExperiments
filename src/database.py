@@ -1,6 +1,9 @@
-from utils import EnumABCMeta
+import local_logger
 import storage
 import experiments
+import llms
+import strategies
+
 from transformers.models.bert import BertTokenizerFast
 from small_text.integrations.transformers.datasets import TransformersDataset
 import datasets
@@ -11,7 +14,6 @@ import re
 import dataclasses
 import pathlib
 import functools
-import enum
 import json
 import itertools
 from typing import Iterable, Callable
@@ -29,6 +31,8 @@ class Indices(storage.Storable):
 
 @storage.Storable.make_storable(storage.StorableType.SEEDED_INDICES)
 class SeededIndices(Indices):
+    CURRENT_VERSION = 1
+
     def __init__(self, size: int, seed: int, dataset_size: int):
         indices = np.arange(dataset_size)
         rng = np.random.default_rng(seed)
@@ -58,6 +62,7 @@ class SeededIndices(Indices):
                         'seed': self.seed,
                         'size': self.size,
                         'dataset_size': self.dataset_size,
+                        'version': self.CURRENT_VERSION,
                     },
                     type=storage.StorableType.SEEDED_INDICES,
                     id=self.get_id(),
@@ -66,13 +71,29 @@ class SeededIndices(Indices):
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < SeededIndices.CURRENT_VERSION:
+            return SeededIndices.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: 'storage.StorableEntry', data: 'DataDatabase', storable_type: storage.StorableType | None = None
     ) -> 'SeededIndices':
         if entry.id in data and storable_type != storage.StorableType.SEEDED_INDICES:
             return data.retrieve(entry.id)
-        payload = entry.payload
+        payload, migrated = SeededIndices.migrate_to_newest_version(entry.payload)
         obj = SeededIndices(size=payload['size'], seed=payload['seed'], dataset_size=payload['dataset_size'])
+        if migrated:
+            del data.stored_index[entry.id]
         data.encache(obj)
         return obj
 
@@ -89,7 +110,7 @@ class DatasetID(storage.Stringifiable):
         return f'{self.path.replace('/', '-')}_{[self.subset, ''][self.subset is None]}'
 
     @staticmethod
-    def from_str(id_str: str) -> 'DatasetID':
+    def from_str(id_str: str, db: 'DataDatabase') -> 'DatasetID':
         m = re.fullmatch(DatasetID.STR_PATTERN, id_str)
         if m is None:
             raise ValueError(f'Invalid DatasetID string: {id_str}')
@@ -98,32 +119,21 @@ class DatasetID(storage.Stringifiable):
         return DatasetID(path=path, subset=subset)
 
 
-@storage.Stringifiable.make_stringifiable()
-class LLMType(storage.Stringifiable, enum.StrEnum, metaclass=EnumABCMeta):
-    GIGACHAT = enum.auto()
-
-    def __str__(self) -> str:
-        return self.value
-
-    def from_str(s: str) -> 'LLMType':
-        for member in LLMType:
-            if member.value == s:
-                return member
-        raise ValueError(f'Invalid LLMType string: {s}')
-
-
 @storage.Storable.make_storable(storage.StorableType.LLM_LABELS)
 @dataclasses.dataclass
 class LLMLabels(storage.Storable):  # TODO: consider pool mapping
     dataset_id: DatasetID
-    llm: LLMType
+    llm: llms.LLMType
     labels: npt.NDArray[np.int64]
+    marked_up: npt.NDArray[np.bool]
+
+    CURRENT_VERSION = 1
 
     def get_id(self) -> storage.ID:
         return f'{self.dataset_id}__{self.llm}#{self._get_salt(self.dataset_id, self.llm)}'
 
     @staticmethod
-    def _get_salt(dataset_id: DatasetID, llm: LLMType) -> storage.Hash:
+    def _get_salt(dataset_id: DatasetID, llm: llms.LLMType) -> storage.Hash:
         return storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, (dataset_id, llm))))
 
     def as_storable(self) -> storage.StorableBundle:
@@ -137,8 +147,10 @@ class LLMLabels(storage.Storable):  # TODO: consider pool mapping
                     payload={
                         'llm': str(self.llm),
                         'labels': array_wrapper.get_id(),
+                        'version': self.CURRENT_VERSION,
                     },
                     type=storage.StorableType.LLM_LABELS,
+                    id=self.get_id(),
                 ),
                 **array_wrapper.as_storable().entries,
                 # array_id: storage.StorableEntry.from_npy(self.labels),
@@ -146,17 +158,33 @@ class LLMLabels(storage.Storable):  # TODO: consider pool mapping
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < LLMLabels.CURRENT_VERSION:
+            return LLMLabels.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
     ) -> 'LLMLabels':
         if entry.id in data and storable_type != storage.StorableType.LLM_LABELS:
             return data.retrieve(entry.id)
-        payload = entry.payload
+        payload, migrated = LLMLabels.migrate_to_newest_version(entry.payload)
         obj = LLMLabels(
-            dataset_id=DatasetID.from_str(payload['dataset_id']),
-            llm=LLMType.from_str(payload['llm']),
+            dataset_id=DatasetID.from_str(payload['dataset_id'], data),
+            llm=llms.LLMType.from_str(payload['llm'], data),
             labels=data.retrieve(payload['labels']).array,
         )
+        if migrated:
+            del data.stored_index[entry.id]
         data.encache(obj)
         return obj
 
@@ -247,6 +275,8 @@ class LazyTrainDataset:
 
 @storage.Storable.make_storable(storage.StorableType.POOL)
 class Pool(storage.Storable):
+    CURRENT_VERSION = 1
+
     def __init__(self, indices: Indices, dataset: Dataset):
         self.indices = indices
         self.dataset = dataset
@@ -264,6 +294,12 @@ class Pool(storage.Storable):
         if self.__x is None:
             self.__x = self.dataset.x[self.indices.indices]
         return self.__x
+
+    @property
+    def subset(self) -> npt.NDArray[np.bool]:
+        mask = np.zeros(self.dataset.x.shape[0], dtype=np.bool_)
+        mask[self.indices.indices] = True
+        return mask
 
     @property
     def base(self) -> 'CompleteDataset':
@@ -295,6 +331,7 @@ class Pool(storage.Storable):
             payload={
                 'dataset_id': CompleteDataset.make_id(self.base.id),
                 'indices': self.indices.get_id(),
+                'version': self.CURRENT_VERSION,
             },
             type=storage.StorableType.POOL,
             id=self.get_id(),
@@ -309,16 +346,32 @@ class Pool(storage.Storable):
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < Pool.CURRENT_VERSION:
+            return Pool.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
     ) -> 'Pool':
         if entry.id in data and storable_type != storage.StorableType.POOL:
             return data.retrieve(entry.id)
-        payload = entry.payload
+        payload, migrated = Pool.migrate_to_newest_version(entry.payload)
         pool = Pool(
             indices=data.retrieve(payload['indices']),
             dataset=data.retrieve(payload['dataset_id']).lazy_train,
         )
+        if migrated:
+            del data.stored_index[entry.id]
         data.encache(pool)
         return pool
 
@@ -351,8 +404,255 @@ class Pool(storage.Storable):
     #     raise ValueError("Cannot get annotations without base dataset")
 
 
+@storage.Storable.make_storable(storage.StorableType.LLM_INDEX_RECAP_EXAMPLES)
+@dataclasses.dataclass
+class LLMIndexRecapExamples(storage.Storable):
+    dataset_id: DatasetID
+    subset: npt.NDArray[np.bool]
+    llm: llms.LLMType
+    recapped: dict[frozenset[int], npt.NDArray[np.int64]]
+    step_size: int
+
+    CURRENT_VERSION = 1
+
+    @staticmethod
+    def _get_salt(dataset_id: DatasetID, subset: npt.NDArray[np.bool], llm_type: llms.LLMType, step_size: int) -> str:
+        return storage.Storable.combine_hashes(
+            storage.Storable.hash_str(str(dataset_id)),
+            storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, np.where(subset)[0]))),
+            storage.Storable.hash_str(str(llm_type)),
+            storage.Storable.hash_str(str(step_size)),
+        )
+
+    @staticmethod
+    def make_id(
+        dataset_id: DatasetID, subset: npt.NDArray[np.bool], llm_type: llms.LLMType, step_size: int
+    ) -> storage.ID:
+        return f'{dataset_id}__{storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, np.where(subset)[0])))}__{llm_type}__{step_size}#{LLMIndexRecapExamples._get_salt(dataset_id, subset, llm_type, step_size)}'
+
+    def get_id(self) -> storage.ID:
+        return self.make_id(self.dataset_id, self.subset, self.llm, self.step_size)
+
+    def as_storable(self) -> 'storage.StorableBundle':
+        salt = self._get_salt(self.dataset_id, self.subset, self.llm, self.step_size)
+        array_id = f'{salt}_1#{storage.Storable.combine_hashes(*map(storage.Storable.hash_str, (salt, '1')))}'
+        subset_array_wrapper = ArrayWrapper(None, array_id, self.subset)
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): storage.StorableEntry(
+                    payload={
+                        'dataset_id': str(self.dataset_id),
+                        'llm': str(self.llm),
+                        'subset': subset_array_wrapper.get_id(),
+                        'step_size': str(self.step_size),
+                        'recapped': [
+                            {'recap': list(map(int, sorted(prev))), 'fetched': list(map(int, sorted(fetched)))}
+                            for prev, fetched in self.recapped.items()
+                        ],
+                        'version': self.CURRENT_VERSION,
+                    },
+                    type=storage.StorableType.LLM_INDEX_RECAP_EXAMPLES,
+                    id=self.get_id(),
+                ),
+                **subset_array_wrapper.as_storable().entries,
+            },
+        )
+
+    @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < LLMIndexRecapExamples.CURRENT_VERSION:
+            return LLMIndexRecapExamples.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
+    def from_storable(
+        entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
+    ) -> 'LLMIndexRecapExamples':
+        if entry.id in data and storable_type != storage.StorableType.LLM_INDEX_RECAP_EXAMPLES:
+            return data.retrieve(entry.id)
+        payload, migrated = LLMIndexRecapExamples.migrate_to_newest_version(entry.payload)
+        obj = LLMIndexRecapExamples(
+            DatasetID.from_str(payload['dataset_id'], data),
+            data.retrieve(payload['subset']).array,
+            llms.LLMType.from_str(payload['llm'], data),
+            {
+                frozenset(map(int, e['recap'])): np.array(sorted(map(int, e['fetched'])), dtype=np.int64)
+                for e in payload['recapped']
+            },
+            int(payload['step_size']),
+        )
+        if migrated:
+            del data.stored_index[entry.id]
+        data.encache(obj)
+        return obj
+
+
+@storage.Storable.make_storable(storage.StorableType.DIVERSITY_BASED_K_MEANS_CLUSTERS)
+@dataclasses.dataclass
+class DiversityBasedKMeansClusters(storage.Storable):
+    dataset_id: DatasetID
+    subset: npt.NDArray[np.bool]
+    clustered: dict[int, tuple[npt.NDArray[np.int64], ...]]
+
+    CURRENT_VERSION = 1
+
+    @staticmethod
+    def _get_salt(dataset_id: DatasetID, subset: npt.NDArray[np.bool]) -> str:
+        return storage.Storable.combine_hashes(
+            storage.Storable.hash_str('diversitybasedkmeansclusters'),
+            storage.Storable.hash_str(str(dataset_id)),
+            storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, np.where(subset)[0]))),
+        )
+
+    @staticmethod
+    def make_id(dataset_id: DatasetID, subset: npt.NDArray[np.bool]) -> storage.ID:
+        return f'diversitybasedkmeansclusters__{dataset_id}__{storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, np.where(subset)[0])))}#{DiversityBasedKMeansClusters._get_salt(dataset_id, subset)}'
+
+    def get_id(self) -> storage.ID:
+        return self.make_id(self.dataset_id, self.subset)
+
+    def as_storable(self) -> 'storage.StorableBundle':
+        salt = self._get_salt(self.dataset_id, self.subset)
+        array_id = f'{salt}_1#{storage.Storable.combine_hashes(*map(storage.Storable.hash_str, (salt, '1')))}'
+        subset_array_wrapper = ArrayWrapper(None, array_id, self.subset)
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): storage.StorableEntry(
+                    payload={
+                        'dataset_id': str(self.dataset_id),
+                        'subset': subset_array_wrapper.get_id(),
+                        'clustered': {
+                            str(cluster_size): list(list(map(int, cluster)) for cluster in clusters)
+                            for cluster_size, clusters in self.clustered.items()
+                        },
+                        'version': self.CURRENT_VERSION,
+                    },
+                    type=storage.StorableType.DIVERSITY_BASED_K_MEANS_CLUSTERS,
+                    id=self.get_id(),
+                ),
+                **subset_array_wrapper.as_storable().entries,
+            },
+        )
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload['version'] < DiversityBasedKMeansClusters.CURRENT_VERSION:
+            assert False, 'impossible'
+            # return ..., True
+        return payload, False
+
+    @staticmethod
+    def from_storable(
+        entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
+    ) -> 'DiversityBasedKMeansClusters':
+        if entry.id in data and storable_type != storage.StorableType.DIVERSITY_BASED_K_MEANS_CLUSTERS:
+            return data.retrieve(entry.id)
+        payload, migrated = DiversityBasedKMeansClusters.migrate_to_newest_version(entry.payload)
+        obj = DiversityBasedKMeansClusters(
+            DatasetID.from_str(payload['dataset_id'], data),
+            data.retrieve(payload['subset']).array,
+            {
+                int(cluster_size): tuple(np.array(cluster, dtype=np.int64) for cluster in clusters)
+                for cluster_size, clusters in payload['clustered'].items()
+            },
+        )
+        if migrated:
+            del data.stored_index[entry.id]
+        data.encache(obj)
+        return obj
+
+
+@storage.Storable.make_storable(storage.StorableType.LLM_CLUSTER_EXAMPLES)
+@dataclasses.dataclass
+class LLMClusterExamples(storage.Storable):
+    dataset_id: DatasetID
+    subset: npt.NDArray[np.bool]
+    llm: llms.LLMType
+    cluster_to_examples: dict[frozenset[int], int]
+
+    CURRENT_VERSION = 1
+
+    @staticmethod
+    def _get_salt(dataset_id: DatasetID, llm_type: llms.LLMType, subset: npt.NDArray[np.bool]) -> str:
+        return storage.Storable.combine_hashes(
+            'llmclusterexamples',
+            storage.Storable.hash_str(str(dataset_id)),
+            storage.Storable.hash_str(str(llm_type)),
+            storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, np.where(subset)[0]))),
+        )
+
+    @staticmethod
+    def make_id(dataset_id: DatasetID, llm_type: llms.LLMType, subset: npt.NDArray[np.bool]) -> storage.ID:
+        return f'llmclusterexamples__{dataset_id}__{llm_type}__{storage.Storable.combine_hashes(*map(storage.Storable.hash_str, map(str, np.where(subset)[0])))}#{LLMClusterExamples._get_salt(dataset_id, llm_type, subset)}'
+
+    def get_id(self) -> storage.ID:
+        return self.make_id(self.dataset_id, self.llm, self.subset)
+
+    def as_storable(self) -> 'storage.StorableBundle':
+        salt = self._get_salt(self.dataset_id, self.llm, self.subset)
+        array_id = f'{salt}_1#{storage.Storable.combine_hashes(*map(storage.Storable.hash_str, (salt, '1')))}'
+        subset_array_wrapper = ArrayWrapper(None, array_id, self.subset)
+        return storage.StorableBundle(
+            main=self.get_id(),
+            entries={
+                self.get_id(): storage.StorableEntry(
+                    payload={
+                        'dataset_id': str(self.dataset_id),
+                        'subset': subset_array_wrapper.get_id(),
+                        'llm': str(self.llm),
+                        'cluster_to_examples': [
+                            {'cluster': list(map(int, sorted(cluster))), 'fetched': selected}
+                            for cluster, selected in self.cluster_to_examples.items()
+                        ],
+                        'version': self.CURRENT_VERSION,
+                    },
+                    type=storage.StorableType.LLM_CLUSTER_EXAMPLES,
+                    id=self.get_id(),
+                ),
+                **subset_array_wrapper.as_storable().entries,
+            },
+        )
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload['version'] < LLMClusterExamples.CURRENT_VERSION:
+            assert False, 'impossible'
+            # return ..., True
+        return payload, False
+
+    @staticmethod
+    def from_storable(
+        entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
+    ) -> 'LLMClusterExamples':
+        if entry.id in data and storable_type != storage.StorableType.LLM_CLUSTER_EXAMPLES:
+            return data.retrieve(entry.id)
+        payload, migrated = LLMClusterExamples.migrate_to_newest_version(entry.payload)
+        obj = LLMClusterExamples(
+            DatasetID.from_str(payload['dataset_id'], data),
+            data.retrieve(payload['subset']).array,
+            llms.LLMType.from_str(payload['llm'], data),
+            {frozenset(map(int, e['cluster'])): int(e['fetched']) for e in payload['cluster_to_examples']},
+        )
+        if migrated:
+            del data.stored_index[entry.id]
+        data.encache(obj)
+        return obj
+
+
 @storage.Storable.make_storable(storage.StorableType.DATASET)
-class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
+class CompleteDataset(storage.Storable):
+    CURRENT_VERSION = 1
+
     def __init__(
         self,
         id: DatasetID,
@@ -375,7 +675,7 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
         self.cache_on_disk = cache_on_disk
 
     @property
-    def annotations(self) -> dict[LLMType, LLMLabels]:  # TODO: pass storage object
+    def annotations(self) -> dict[llms.LLMType, LLMLabels]:  # TODO: pass storage object
         if self.__annotations is not None:
             return self.__annotations
         self.__annotations = {}
@@ -388,7 +688,7 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
 
     def __load_annotations(self, config: dict):
         self.__annotations = {
-            LLMType.from_str(llm_str): LLMLabels.load(self.__root_dir, label_file)
+            llms.LLMType.from_str(llm_str): LLMLabels.load(self.__root_dir, label_file)
             for llm_str, label_file in config['annotations'].items()
         }
 
@@ -471,6 +771,7 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
                         'label_field': self.label_field,
                         'dataset': str(self.id),
                         'train_len': self.len_train,
+                        'version': self.CURRENT_VERSION,
                     },
                     type=storage.StorableType.DATASET,
                     id=self.get_id(),
@@ -479,19 +780,35 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < CompleteDataset.CURRENT_VERSION:
+            return CompleteDataset.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
     ) -> 'CompleteDataset':
         if entry.id in data and storable_type != storage.StorableType.DATASET:
             return data.retrieve(entry.id)
-        payload = entry.payload
+        payload, migrated = CompleteDataset.migrate_to_newest_version(entry.payload)
         obj = CompleteDataset(
-            id=DatasetID.from_str(payload['dataset']),
+            id=DatasetID.from_str(payload['dataset'], data),
             text_field=payload['text_field'],
             label_field=payload['label_field'],
             database=data,
             train_len=payload['train_len'],
         )
+        if migrated:
+            del data.stored_index[entry.id]
         data.encache(obj)
         return obj
 
@@ -507,6 +824,8 @@ class CompleteDataset(storage.Storable):  # TODO: Consider dumping on disk
 
 @storage.Storable.make_storable(storage.StorableType.DATASETS)
 class Datasets(storage.Storable):
+    CURRENT_VERSION = 1
+
     def __init__(self, *datasets: CompleteDataset):
         self.datasets = {dataset.id: dataset for dataset in datasets}
 
@@ -555,6 +874,7 @@ class Datasets(storage.Storable):
                             str(dataset_id): CompleteDataset.make_id(dataset.id)
                             for dataset_id, dataset in self.datasets.items()
                         },
+                        'version': self.CURRENT_VERSION,
                     },
                     type=storage.StorableType.DATASETS,
                     id=self.get_id(),
@@ -564,19 +884,37 @@ class Datasets(storage.Storable):
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < Datasets.CURRENT_VERSION:
+            return Datasets.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
     ) -> 'Datasets':
         if entry.id in data and storable_type != storage.StorableType.DATASETS:
             return data.retrieve(entry.id)
-        payload = entry.payload
+        payload, migrated = Datasets.migrate_to_newest_version(entry.payload)
         obj = Datasets(data.retrieve(dataset_entry_id) for dataset_entry_id in payload['datasets'].values())
+        if migrated:
+            del data.stored_index[entry.id]
         data.encache(obj)
         return obj
 
 
 @storage.Storable.make_storable(storage.StorableType.ARRAY_WRAPPER)
 class ArrayWrapper(storage.Storable):
+    CURRENT_VERSION = 1
+
     def __init__(self, database: 'DataDatabase', arr_id: storage.ID, arr: npt.NDArray | None = None):
         self.id = arr_id
         self.db = database
@@ -598,16 +936,22 @@ class ArrayWrapper(storage.Storable):
     def get_id(self) -> storage.ID:
         return self.id
 
+    @staticmethod
+    def make_id() -> storage.ID:
+        raise ValueError('ArrayWrapper can\' have static id, it should be passed to concrete class')
+
     def as_storable(self) -> storage.StorableBundle:
+        payload = {
+            'rel_path': str(pathlib.Path('bin/') / storage.Format.NPZ.format_name(self.id, storage.StorableType.ARRAY)),
+            'version': self.CURRENT_VERSION,
+        }
+        if self.__array is not None:
+            payload['array'] = self.__array
         return storage.StorableBundle(
             main=self.get_id(),
             entries={
                 self.get_id(): storage.StorableEntry(
-                    payload={
-                        'rel_path': str(
-                            pathlib.Path('bin/') / storage.Format.NPZ.format_name(self.id, storage.StorableType.ARRAY)
-                        )
-                    },
+                    payload=payload,
                     type=storage.StorableType.ARRAY_WRAPPER,
                     id=self.get_id(),
                 ),
@@ -615,9 +959,23 @@ class ArrayWrapper(storage.Storable):
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < ArrayWrapper.CURRENT_VERSION:
+            return ArrayWrapper.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: storage.StorableEntry, data: 'DataDatabase', storable_type: storage.StorableType | None = None
-    ) -> 'Datasets':
+    ) -> 'ArrayWrapper':
         if entry.id in data and storable_type != storage.StorableType.ARRAY_WRAPPER:
             return data.retrieve(entry.id)
         obj = ArrayWrapper(data, entry.id)
@@ -628,14 +986,24 @@ class ArrayWrapper(storage.Storable):
 class DataDatabase:
     BACKUPS_COUNT = 5
 
-    def __init__(self, root_dir: pathlib.Path, local: bool = True):  # TODO  implement remote
+    def __init__(
+        self,
+        root_dir: pathlib.Path,
+        *,
+        logger: local_logger.Logger | None = None,
+        local: bool = True,
+    ):  # TODO  implement remote
         self.objects_store: dict[storage.ID, storage.Storable] = {}
         self.stored_index: dict[storage.ID, storage.StoredEntry] = {}
         self.root_dir = root_dir
         self.local = local
+        if logger is None:
+            logger = local_logger.Logger(verbose_console=True)
+        self.logger = logger
         self.__connected = False
         self.__datasets: Datasets = None
         self.__experiments: experiments.Experiments = None
+        self.llms: dict[llms.LLMType, llms.LLM] = {}
 
     @property
     def datasets(self) -> Datasets:
@@ -648,6 +1016,11 @@ class DataDatabase:
         if self.__experiments is None:
             self.__experiments = experiments.Experiments()
         return self.__experiments
+
+    def connect_llm(self, llm_type: llms.LLMType, llm_instance: llms.LLM):
+        if llm_type in self.llms:
+            raise KeyError(f'LLM of type {llm_type} already stored in database!')
+        self.llms[llm_type] = llm_instance
 
     def retrieve(self, obj_id: storage.ID, *, force_load: bool = False) -> storage.Storable:
         if obj_id in self.objects_store and not force_load:
@@ -678,8 +1051,8 @@ class DataDatabase:
             and obj in self.stored_index
             and not inconsistent_ok
         ):
-            print(
-                f'[WARNING]: {'Experiment' if isinstance(obj, experiments.Experiment) else 'ExperimentHistory'} {obj} with id {id} deleted from objects, but present in stored_index'
+            self.logger.warn(
+                f'{'Experiment' if isinstance(obj, experiments.Experiment) else 'ExperimentHistory'} {obj} with id {id} deleted from objects, but present in stored_index'
             )
 
     def add_to_store_index(
@@ -717,14 +1090,16 @@ class DataDatabase:
                     stored_entry = self.stored_index[obj.id]
                     loaded = self.__load_from_disk_presumably(obj.id, stored_entry.format, obj.type)
                     if self.storables_differ(loaded.obj, obj):
-                        print(
-                            f'[WARNING]: for object with id {obj.id} stored entry on disk {loaded.obj} differs from entry being stored {obj}. Trying to merge...'
+                        self.logger.warn(
+                            f'for object with id {obj.id} stored entry on disk {loaded.obj} differs from entry being stored {obj}. Trying to merge...',
+                            f'for object with id {obj.id} stored entry on disk differs from entry being stored. Trying to merge...',
                         )
                         try:
                             merged = self.merge_storables(obj, loaded.obj)
                         except ValueError:
-                            print(
-                                f'[WARNING]: Failed to merge {obj.id}, preferring entry being stored {obj}, leaving disk one unchanged'
+                            self.logger.warn(
+                                f'Failed to merge {obj.id}, preferring entry being stored {obj}, leaving disk one unchanged',
+                                f'Failed to merge {obj.id}, preferring entry being stored, leaving disk one unchanged',
                             )
                             merged = self.__try_merge_storables(obj, loaded.obj)
                             obj = merged
@@ -790,8 +1165,9 @@ class DataDatabase:
                 try:
                     result = DataDatabase.merge_storables(encached, was)
                 except ValueError:
-                    print(
-                        f'[WARNING]: Can\'t merge storables {encached} and {was} with id {obj.get_id()}! Preferring encached {encached} for object {obj}'
+                    self.logger.warn(
+                        f'Can\'t merge storables {encached} and {was} with id {obj.get_id()}! Preferring encached {encached} for object {obj}',
+                        f'Can\'t merge storables with id {obj.get_id()}! Preferring encached for object {type(obj)}',
                     )
                     result = DataDatabase.__try_merge_storables(encached, was)
                 self.add_to_store_index(result, force=True)
@@ -805,14 +1181,16 @@ class DataDatabase:
             encached = self.objects_store[obj.id].as_storable()
             encached = encached.entries[encached.main]
             if DataDatabase.storables_differ(encached, obj):
-                print(
-                    f'[WARNING]: object being stored {obj} differs from encached object {encached}. Trying to merge...'
+                self.logger.warn(
+                    f'object being stored {obj} differs from encached object {encached}. Trying to merge...',
+                    f'object being stored differs from encached object. Trying to merge...',
                 )
                 try:
                     merged = self.merge_storables(encached, obj)
                 except ValueError:
-                    print(
-                        f'[WARNING]: Failed to merge {obj.id}, preferring the one just stored {obj}, differing from {encached}'
+                    self.logger.warn(
+                        f'Failed to merge {obj.id}, preferring the one just stored {obj}, differing from {encached}',
+                        f'Failed to merge {obj.id}, preferring the one just stored, differing from encached',
                     )
                     merged = self.__try_merge_storables(obj, encached)
                 self.destroy(merged.id, inconsistent_ok=True)
@@ -850,18 +1228,20 @@ class DataDatabase:
             self.__on_storage_update(self.stored_index[obj_id].obj)
         else:
             if self.storables_differ(bundle.entries[obj_id], self.stored_index[obj_id].obj):
-                print(
-                    f'[WARNING]: entry being stored fast {bundle.entries[obj_id]} differs from entry already stored! Trying to merge...'
+                self.logger.warn(
+                    f'entry being stored fast {bundle.entries[obj_id]} differs from entry already stored! Trying to merge...',
+                    f'entry being stored fast {obj_id} differs from entry already stored! Trying to merge...',
                 )
                 try:
                     merged = self.merge_storables(bundle.entries[obj_id], self.stored_index[obj_id].obj)
                 except ValueError:
-                    print(
-                        f'[WARNING]: Failed to merge, preferring entry being stored {bundle.entries[obj_id]} over {self.stored_index[obj_id]}'
+                    self.logger.warn(
+                        f'Failed to merge, preferring entry being stored {bundle.entries[obj_id]} over {self.stored_index[obj_id]}',
+                        f'Failed to merge, preferring entry being stored {obj_id} over one in stored index',
                     )
                     merged = self.__try_merge_storables(bundle.entries[obj_id], self.stored_index[obj_id].obj)
                 self.add_to_store_index(merged, force=True)
-                self.__store_entry(bundle.entries[obj_id], obj_format)
+                self.__store_entry(merged, obj_format)
             self.stored_index[obj_id].stored = True
             self.stored_index[obj_id].format = obj_format
 
@@ -878,6 +1258,8 @@ class DataDatabase:
 
     def __get_rel_directory(self, entry_type: storage.StorableType) -> pathlib.Path:
         match entry_type:
+            case storage.StorableType.ARRAY_WRAPPER:
+                return pathlib.Path('wrappers')
             case storage.StorableType.ARRAY:
                 return pathlib.Path('bin')
             case storage.StorableType.POOL:
@@ -892,6 +1274,12 @@ class DataDatabase:
                 return pathlib.Path()
             case storage.StorableType.LLM_LABELS:
                 assert False  # TODO: implement label storing
+            case storage.StorableType.LLM_INDEX_RECAP_EXAMPLES:
+                return pathlib.Path('llm', 'index_recap_examples')
+            case storage.StorableType.LLM_CLUSTER_EXAMPLES:
+                return pathlib.Path('llm', 'cluster_examples')
+            case storage.StorableType.DIVERSITY_BASED_K_MEANS_CLUSTERS:
+                return pathlib.Path('llm', 'diversity_based_k_means_clusters')
             case storage.StorableType.EXPERIMENT:
                 return pathlib.Path('experiments')
             case _:
@@ -899,6 +1287,13 @@ class DataDatabase:
 
     def __pre_store_entry(self, obj: 'storage.StorableEntry', where: pathlib.Path):
         where.parent.mkdir(parents=True, exist_ok=True)
+        if obj.type == storage.StorableType.ARRAY_WRAPPER and 'array' in obj.payload:
+            storage.Formatter.dump(
+                storage.StorableEntry.from_npy(obj.payload['array'], None),
+                storage.Format.NPZ,
+                self.root_dir / storage.DATA_DIR / obj.payload['rel_path'],
+            )
+            del obj.payload['array']
 
     def __post_store_entry(
         self,
@@ -943,10 +1338,15 @@ class DataDatabase:
             if obj.get_id() not in self.stored_index:
                 self.add_to_store_index(obj.as_storable(), inconsistent_in_cache_ok=True)
             elif self.storables_differ(encached, self.stored_index[obj.get_id()].obj):
-                print(
-                    f'[WARNING]: during dump for id {encached.id} inconsistent storable {self.stored_index[obj.get_id()].obj} and encached object {encached}! Preferring encached'
+                self.logger.warn(
+                    f'during dump for id {encached.id} inconsistent storable {self.stored_index[obj.get_id()].obj} and encached object {encached}! Preferring encached',
+                    f'during dump for id {encached.id} inconsistent storable and encached object! Preferring encached',
                 )
                 self.add_to_store_index(obj.as_storable(), force=True)
+
+        for obj in self.stored_index.values():
+            if obj.obj.type == storage.StorableType.ARRAY_WRAPPER and 'array' in obj.obj.payload:
+                del obj.obj.payload['array']
 
         return previous_backup_id
 
@@ -982,8 +1382,9 @@ class DataDatabase:
                         try:
                             merged = self.merge_storables(stored_entry.obj, loaded.obj)
                         except ValueError:
-                            print(
-                                f'[ERROR]: Failed to recollect object with id {obj_id}. Skipping {path}. On disk: {loaded.obj}, in RAM: {stored_entry.obj}.'
+                            self.logger.error(
+                                f'Failed to recollect object with id {obj_id}. Skipping {path}. On disk: {loaded.obj}, in RAM: {stored_entry.obj}.',
+                                f'Failed to recollect object with id {obj_id}. Skipping {path}',
                             )
                         else:
                             self.add_to_store_index(merged, force=True, inconsistent_on_disk_ok=True)
@@ -999,8 +1400,9 @@ class DataDatabase:
                         try:
                             merged = self.merge_storables(stored_entry.obj, loaded.obj)
                         except ValueError:
-                            print(
-                                f'[ERROR]: Failed to recollect object with id {obj_id}. Skipping {path}. On disk: {loaded.obj}, in RAM: {stored_entry.obj}.'
+                            self.logger.error(
+                                f'Failed to recollect object with id {obj_id}. Skipping {path}. On disk: {loaded.obj}, in RAM: {stored_entry.obj}.',
+                                f'Failed to recollect object with id {obj_id}. Skipping {path}',
                             )
                         else:
                             self.add_to_store_index(merged, force=True, inconsistent_ok=True)
@@ -1015,7 +1417,7 @@ class DataDatabase:
         self.dump()
 
         for file in recollected_files:
-            print(f'[WARNING]: deleting file {file}')
+            self.logger.warn(f'deleting file {file}')
             file.unlink()
 
         def warn_unindexed(folder: pathlib.Path, file: pathlib.Path):
@@ -1024,7 +1426,7 @@ class DataDatabase:
                 return
             stored_id = storage.Format.id_from_format_name(file.name)
             if stored_id not in self.stored_index:
-                print(f'[WARNING]: unindexed file: {file} for id {stored_id} with type {stored_type}')
+                self.logger.warn(f'unindexed file: {file} for id {stored_id} with type {stored_type}')
 
         self.__walk_local_storage(warn_unindexed)
 
@@ -1050,22 +1452,29 @@ class DataDatabase:
             if not is_stored and not is_encached:
                 if not completely_storable(loaded.obj):
                     ref_id = next(ref_id for ref_id in loaded.obj.get_references() if ref_id not in self)
-                    print(
-                        f'[ERROR]: Failed to load {file}, because referenced id {ref_id} is missing. Loaded: {loaded.obj}'
+                    self.logger.error(
+                        f'Failed to load {file}, because referenced id {ref_id} is missing. Loaded: {loaded.obj}',
+                        f'Failed to load {file}, because referenced id {ref_id} is missing',
                     )
                     return
                 self.add_to_store_index(loaded.obj)
             elif not is_stored and is_encached:
-                print(f'[WARNING]: unindexed stored file: {file} that was recreated: {stored_id}')
+                self.logger.warn(f'unindexed stored file: {file} that was recreated: {stored_id}')
                 bundle = was.as_storable()
                 entry = bundle.entries[bundle.main]
                 try:
                     merged = DataDatabase.merge_storables(entry, loaded.obj)
                 except ValueError:
-                    print(f'[ERROR]: Failed to merge id {entry.id} loaded {loaded.obj} with encached {stored_entry}. Trying to merge with encached preference...')
+                    self.logger.error(
+                        f'Failed to merge id {entry.id} loaded {loaded.obj} with encached {stored_entry}. Trying to merge with encached preference...',
+                        f'Failed to merge id {entry.id} loaded with encached. Trying to merge with encached preference...',
+                    )
                     merged = DataDatabase.__try_merge_storables(entry, loaded.obj)
                 if not completely_storable(merged):
-                    print(f'[ERROR]: Failed to add merged id {merged.id} entry {merged} when merging with {entry}. Skipping...')
+                    self.logger.error(
+                        f'Failed to add merged id {merged.id} entry {merged} when merging with {entry}. Skipping...',
+                        f'Failed to add merged id {merged.id} entry when merging with loaded. Skipping...',
+                    )
                     return
                 self.destroy(merged.id)
                 self.__recreate(merged)
@@ -1074,14 +1483,20 @@ class DataDatabase:
                     try:
                         merged = DataDatabase.merge_storables(loaded.obj, stored_entry)
                     except ValueError:
-                        print(f'[ERROR]: Failed to merge id {stored_entry.id} loaded {loaded.obj} with stored {stored_entry}. Trying to merge with stored preference...')
+                        self.logger.error(
+                            f'Failed to merge id {stored_entry.id} loaded {loaded.obj} with stored {stored_entry}. Trying to merge with stored preference...',
+                            f'Failed to merge id {stored_entry.id} loaded with stored. Trying to merge with stored preference...',
+                        )
                         merged = DataDatabase.__try_merge_storables(stored_entry, loaded.obj)
                     if not completely_storable(merged):
-                        print(f'[ERROR]: Failed to add merged id {merged.id} entry {merged} when merging with {stored_entry}. Skipping...')
+                        self.logger.error(
+                            f'Failed to add merged id {merged.id} entry {merged} when merging with {stored_entry}. Skipping...',
+                            f'Failed to add merged id {merged.id} entry when merging with stored. Skipping...',
+                        )
                         return
                     self.add_to_store_index(merged, force=True)
                 elif not self.stored_index[stored_id].stored_on_disk:
-                    print(f'[WARNING]: Consistent stored on disk file: {file}. Marking as stored on disk')
+                    self.logger.warn(f'Consistent stored on disk file: {file}. Marking as stored on disk')
                     self.stored_index[stored_id].stored = True
                     self.stored_index[stored_id].format = storage.Format.format_from_format_name(file.name)
             elif is_stored and is_encached:
@@ -1092,10 +1507,16 @@ class DataDatabase:
                     try:
                         merged = DataDatabase.merge_storables(stored_entry, loaded.obj)
                     except ValueError:
-                        print(f'[ERROR]: Failed to merge id {stored_entry.id} loaded {loaded.obj} with stored {stored_entry}. Trying to merge with in db preference...')
+                        self.logger.error(
+                            f'Failed to merge id {stored_entry.id} loaded {loaded.obj} with stored {stored_entry}. Trying to merge with in db preference...',
+                            f'Failed to merge id {stored_entry.id} loaded with stored. Trying to merge with in db preference...',
+                        )
                         merged = DataDatabase.__try_merge_storables(stored_entry, loaded.obj)
                     if not completely_storable(merged):
-                        print(f'[ERROR]: Failed to add merged id {merged.id} entry {merged} when merging with {stored_entry}. Skipping...')
+                        self.logger.error(
+                            f'Failed to add merged id {merged.id} entry {merged} when merging with {stored_entry}. Skipping...',
+                            f'Failed to add merged id {merged.id} entry when merging with stored. Skipping...',
+                        )
                         return
                     self.destroy(merged.id)
                     self.add_to_store_index(merged, force=True)
@@ -1105,7 +1526,7 @@ class DataDatabase:
                             self.stored_index[stored_id].format or storage.Format.JSON,
                         )
                 elif not self.stored_index[stored_id].stored_on_disk:
-                    print(f'[WARNING]: Consistent stored on disk file: {file}. Marking as stored on disk')
+                    self.logger.warn(f'Consistent stored on disk file: {file}. Marking as stored on disk')
                     self.stored_index[stored_id].stored = True
                     self.stored_index[stored_id].format = storage.Format.format_from_format_name(file.name)
             else:
@@ -1124,6 +1545,8 @@ class DataDatabase:
     def __walk_local_storage(self, callback: Callable[[pathlib.Path, pathlib.Path], None]):
         data_folder = self.root_dir / storage.DATA_DIR
         for folder in (
+            data_folder / 'wrappers',
+            data_folder / 'llm' / 'index_recap_examples',
             data_folder / 'datasets',
             data_folder / 'markup' / 'indices',
             data_folder / 'markup' / 'pools',
@@ -1168,12 +1591,17 @@ class DataDatabase:
     def get_experiment(self, obj: 'experiments.Experiment') -> 'experiments.Experiment':
         if obj.get_id() in self.stored_index and obj.get_id() not in self.objects_store:
             raise RuntimeError(
-                f'[ERROR]: Inconsistent stored_index and objects_store for Experiment; id: {obj.get_id()}, experiment: {self.stored_index[obj.get_id()]}'
+                f'Inconsistent stored_index and objects_store for Experiment; id: {obj.get_id()}, experiment: {self.stored_index[obj.get_id()]}'
             )
         if obj in self.experiments:
             return self.experiments[obj][0]
         self.encache(obj)
         return obj
+
+    def get_llm(self, llm_type: llms.LLMType) -> llms.LLM:
+        if llm_type not in self.llms:
+            raise KeyError(f'LLM of type {llm_type} is not connected!')
+        return self.llms[llm_type]
 
     @staticmethod
     def get_config_name() -> str:
@@ -1204,8 +1632,9 @@ class DataDatabase:
                 or (
                     not entry.obj.type.is_groupable()
                     and (
-                        print(
-                            f'[WARNING]: ungrouppable entry {entry.obj.id} is not stored on disk after pre dump during storables list generation! Entry contents: {entry}'
+                        self.logger.warn(
+                            f'ungrouppable entry {entry.obj.id} is not stored on disk after pre dump during storables list generation! Entry contents: {entry}',
+                            f'ungrouppable entry {entry.obj.id} is not stored on disk after pre dump during storables list generation!',
                         )
                         and True
                     )
@@ -1220,14 +1649,21 @@ class DataDatabase:
         return cls.load(root_dir / storage.DATA_DIR / f'{cls.get_config_name()}.json', root_dir, local=local)
 
     @classmethod
-    def load(cls, config_path: pathlib.Path, root_dir: pathlib.Path, *, local: bool = True) -> 'DataDatabase':
+    def load(
+        cls,
+        config_path: pathlib.Path,
+        root_dir: pathlib.Path,
+        *,
+        logger: local_logger.Logger | None = None,
+        local: bool = True,
+    ) -> 'DataDatabase':
         if not local:
             assert False, 'TODO: implement remote'
         if not config_path.exists():
             raise FileNotFoundError(f'Config file {config_path} does not exist')
         with config_path.open('r') as dbf:
             config = json.load(dbf)
-        db = cls(root_dir, local)
+        db = cls(root_dir, logger=logger, local=local)
         db.__load_config(config)
         return db
 
@@ -1262,7 +1698,7 @@ class DataDatabase:
                     config, obj_id
                 )  # TODO: consider adding refs not to load everything on start
             except FileNotFoundError:
-                print(f'[WARNING]: file for stored object with id {obj_id} not found, considering it dead id')
+                self.logger.warn(f'file for stored object with id {obj_id} not found, considering it dead id')
                 dead_ids.append((obj_id, storage.StorableType(config['refs'][obj_id]['type'])))
 
         self.__recursively_clean_dead_ids(config, dead_ids)
@@ -1271,9 +1707,36 @@ class DataDatabase:
         assert not tuple(self.experiments)
         assert not tuple(self.datasets)
 
+        self.__migrate_entries_on_disk(config)
+
         for obj_id in itertools.chain(config['datasets'], config['experiments']):
             if obj_id not in self.objects_store and obj_id in self.stored_index:
                 self.__recreate(self.stored_index[obj_id].obj, inconsistent_after_encache_ok=True)
+
+    def __migrate_entries_on_disk(self, config: dict):
+        tmp_dict = dict(self.stored_index.items())
+        for entry_id, entry in tmp_dict.items():
+            if entry.obj.type == storage.StorableType.ARRAY_WRAPPER:
+                continue
+
+            entry_cls = storage.Storable.storable_classes[storage.StorableType(entry.obj.type)]
+            if entry.obj.payload.get('version', 0) < entry_cls.CURRENT_VERSION:
+                self.logger.warn(
+                    f'entry with id {entry_id} migrating from format version {entry.obj.payload.get('version', 0)} to {entry_cls.CURRENT_VERSION}. Previous payload: {entry.obj.payload}. Changing stored index!',
+                    f'entry with id {entry_id} migrating from format version {entry.obj.payload.get('version', 0)} to {entry_cls.CURRENT_VERSION}. Changing stored index!',
+                )
+                migrated_payload = entry_cls.migrate_to_newest_version(entry.obj.payload)[0]
+                entry.obj = dataclasses.replace(entry.obj, payload=migrated_payload)
+            entry = self.stored_index[entry_id]
+
+            if entry.stored_on_disk:
+                loaded = self.__load_from_disk(config, entry_id)
+                if loaded.obj.payload.get('version', 0) < entry_cls.CURRENT_VERSION:
+                    self.logger.warn(
+                        f'entry with id {entry_id} migrating from format version {loaded.obj.payload.get('version', 0)} to {entry_cls.CURRENT_VERSION}. Previous payload: {loaded.obj.payload}. Changing stored on disk!',
+                        f'entry with id {entry_id} migrating from format version {loaded.obj.payload.get('version', 0)} to {entry_cls.CURRENT_VERSION}. Changing stored on disk!',
+                    )
+                    self.__store_entry(entry.obj, entry.format, update_index=False)
 
     def __load_from_disk(self, config: dict, obj_id: 'storage.ID') -> 'storage.StoredEntry':
         if not self.local:
@@ -1335,8 +1798,8 @@ class DataDatabase:
                         dead_type == storage.StorableType.EXPERIMENT_HISTORY
                         and entry.obj.type == storage.StorableType.EXPERIMENT
                     ):
-                        print(
-                            f'[WARNING]: History {dead_id} for experiment {entry.obj.id} not found, popping from histories'
+                        self.logger.warn(
+                            f'History {dead_id} for experiment {entry.obj.id} not found, popping from histories'
                         )
                         run_number = (
                             list(
@@ -1361,11 +1824,12 @@ class DataDatabase:
                                 / self.__get_rel_directory(entry.obj.type)
                                 / entry.format.format_name(entry.obj.id, entry.obj.type)
                             )
-                            print(f'[WARNING]: Updating stored file {path} with cutted version')
+                            self.logger.warn(f'Updating stored file {path} with cutted version')
                             self.__store_entry(entry.obj, entry.format, update_index=False)
                     else:
-                        print(
-                            f'[WARNING]: incomplete object {stored_id} removing from stored index. Content: {entry.obj}'
+                        self.logger.warn(
+                            f'incomplete object {stored_id} removing from stored index. Content: {entry.obj}',
+                            f'incomplete object {stored_id} removing from stored index',
                         )
                         stored_type = self.stored_index[stored_id].obj.type
                         del self.stored_index[stored_id]
@@ -1387,7 +1851,23 @@ class DataDatabase:
     def storables_differ(obj1: 'storage.StorableEntry', obj2: 'storage.StorableEntry') -> bool:
         if obj1.type != obj2.type:
             raise ValueError('Can\'t compare different types')
-        return obj1.payload != obj2.payload
+
+        payload1 = storage.Storable.storable_classes[storage.StorableType(obj1.type)].migrate_to_newest_version(
+            obj1.payload
+        )[0]
+        payload2 = storage.Storable.storable_classes[storage.StorableType(obj2.type)].migrate_to_newest_version(
+            obj2.payload
+        )[0]
+
+        if obj1.type == storage.StorableType.ARRAY_WRAPPER:
+
+            def simplify(payload: dict) -> dict:
+                keys = set(payload) - {'array'}
+
+                return {key: payload[key] for key in keys}
+
+            return simplify(payload1) != simplify(payload2)
+        return payload1 != payload2
 
     @staticmethod
     def merge_storables(obj1: 'storage.StorableEntry', obj2: 'storage.StorableEntry') -> 'storage.StorableEntry':
@@ -1395,7 +1875,7 @@ class DataDatabase:
         res2 = DataDatabase.__try_merge_storables(obj2, obj1)
         if res1.payload != res2.payload:
             raise ValueError(
-                f'[ERROR]: Inconsistent merging! ids: {res1.id}, {res2.id}, type: {res1.type}, merge results: {res1.payload}, {res2.payload}'
+                f'Inconsistent merging! ids: {res1.id}, {res2.id}, type: {res1.type}, merge results: {res1.payload}, {res2.payload}'
             )
 
         return res1
@@ -1428,6 +1908,54 @@ class DataDatabase:
                 map(lambda x: (str(x[0]), x[1]), enumerate(sorted(payload['histories'].values()), start=1))
             )
             return storage.StorableEntry(payload, main.type, main.id)
+        if main.type == storage.StorableType.LLM_INDEX_RECAP_EXAMPLES:
+
+            def simplify(payload: dict) -> dict:
+                keys = set(payload) - {'array'}
+                return {key: payload[key] for key in keys}
+
+            payload = simplify(main.payload)
+            ks1 = set(tuple(entry['recap']) for entry in payload['recapped'])
+            ks2 = set(tuple(entry['recap']) for entry in secondary.payload['recapped'])
+            if ks2 != ks1:
+                payload['recapped'].extend(
+                    entry for entry in secondary.payload['recapped'] if tuple(entry['recap']) in ks2 - ks1
+                )
+            if 'array' in main.payload:
+                payload['array'] = main.payload['array']
+            return storage.StorableEntry(payload, main.type, main.id)
+        if main.type == storage.StorableType.DIVERSITY_BASED_K_MEANS_CLUSTERS:
+
+            def simplify(payload: dict) -> dict:
+                keys = set(payload) - {'array'}
+                return {key: payload[key] for key in keys}
+
+            payload = simplify(main.payload)
+            ks1 = set(entry for entry in payload['clustered'])
+            ks2 = set(entry for entry in secondary.payload['clustered'])
+            if ks2 != ks1:
+                payload['clustered'].update(
+                    (key, entry) for key, entry in secondary.payload['clustered'].items() if key in ks2 - ks1
+                )
+            if 'array' in main.payload:
+                payload['array'] = main.payload['array']
+            return storage.StorableEntry(payload, main.type, main.id)
+        if main.type == storage.StorableType.LLM_CLUSTER_EXAMPLES:
+
+            def simplify(payload: dict) -> dict:
+                keys = set(payload) - {'array'}
+                return {key: payload[key] for key in keys}
+
+            payload = simplify(main.payload)
+            ks1 = set(tuple(entry['cluster']) for entry in payload['cluster_to_examples'])
+            ks2 = set(tuple(entry['cluster']) for entry in secondary.payload['cluster_to_examples'])
+            if ks2 != ks1:
+                payload['cluster_to_examples'].extend(
+                    entry for entry in secondary.payload['cluster_to_examples'] if tuple(entry['cluster']) in ks2 - ks1
+                )
+            if 'array' in main.payload:
+                payload['array'] = main.payload['array']
+            return storage.StorableEntry(payload, main.type, main.id)
         raise ValueError(f'Unknown types for merge: {main.type}')
 
     def __enter__(self):
@@ -1436,16 +1964,33 @@ class DataDatabase:
 
         config_path = self.root_dir / storage.DATA_DIR / f'{self.get_config_name()}.json'
         if config_path.exists():
-            tmp = DataDatabase.load(config_path, self.root_dir, local=self.local)
+            tmp = DataDatabase.load(config_path, self.root_dir, logger=self.logger, local=self.local)
             self.objects_store = tmp.objects_store
             self.stored_index = tmp.stored_index
             self.__datasets = tmp.__datasets
             self.__experiments = tmp.__experiments
+            self.llms = tmp.llms
+            for exp in self.__experiments:
+                if isinstance(
+                    exp.cold_start_strategy.query_strategy, strategies.ActiveLLMQueryStrategyType
+                ) or isinstance(exp.cold_start_strategy.query_strategy, strategies.SelectLLMQueryStrategyType):
+                    exp.cold_start_strategy.query_strategy.set_db(self)
+                if isinstance(
+                    exp.active_learning_strategy.query_strategy, strategies.ActiveLLMQueryStrategyType
+                ) or isinstance(exp.active_learning_strategy.query_strategy, strategies.SelectLLMQueryStrategyType):
+                    exp.active_learning_strategy.query_strategy.set_db(self)
+            for obj in self.objects_store:
+                if isinstance(obj, strategies.ActiveLLMQueryStrategyType) or isinstance(
+                    obj, strategies.SelectLLMQueryStrategyType
+                ):
+                    obj.set_db(self)
             tmp.objects_store = {}
             tmp.stored_index = {}
             tmp.__datasets = None
             tmp.__experiments = None
+            tmp.llms = None
         self.__connected = True
+        assert self.llms is not None
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):

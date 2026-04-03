@@ -3,8 +3,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from transformers.models.bert.tokenization_bert_fast import BertTokenizerFast
 
-import strategies
 import database
+import strategies
 from storage import Storable, StorableBundle, StorableEntry, StorableType, ID, Hash, Format
 from utils import carried_partial_apply
 
@@ -14,6 +14,7 @@ from small_text import (
 )
 import numpy as np
 
+from copy import deepcopy
 import datetime
 import uuid
 import builtins
@@ -38,7 +39,8 @@ class ExperimentHistory(Storable):
     duration_cs: datetime.timedelta
     duration_total: datetime.timedelta
     uuid: Optional[str] = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
-    format_version: int = 1
+
+    CURRENT_VERSION = 2
 
     @property
     def split(self) -> int:
@@ -89,10 +91,10 @@ class ExperimentHistory(Storable):
                         'seed': self.seed,
                         'cs_strategy': str(self.cs_strategy),
                         'al_strategy': str(self.al_strategy),
-                        'format_version': self.format_version,
                         'uuid': self.uuid,
                         'duration_cs': self.duration_cs / datetime.timedelta(milliseconds=1),
                         'duration_total': self.duration_total / datetime.timedelta(milliseconds=1),
+                        'version': self.CURRENT_VERSION,
                     },
                     type=StorableType.EXPERIMENT_HISTORY,
                     id=self.get_id(),
@@ -101,27 +103,52 @@ class ExperimentHistory(Storable):
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_payload_from_1_to_2(payload: dict) -> dict:
+        if int(payload.get('version', 0)) < 1:
+            payload = ExperimentHistory.migrate_payload_from_unversioned(payload)
+        new_payload = deepcopy(payload)
+        del new_payload['format_version']
+        new_payload['version'] = 2
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < ExperimentHistory.CURRENT_VERSION:
+            return ExperimentHistory.migrate_payload_from_1_to_2(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: StorableEntry, data: 'database.DataDatabase', storable_type: 'StorableType | None' = None
     ) -> Self:
         if entry.id in data and storable_type != StorableType.EXPERIMENT_HISTORY:
             return data.retrieve(entry.id)
-        payload = entry.payload
+        payload, migrated = ExperimentHistory.migrate_to_newest_version(entry.payload)
         obj = ExperimentHistory(
             final_accuracy=payload['final_accuracy'],
             final_macro_f1=payload['final_macro_f1'],
             after_cold_start_accuracy=payload['after_cold_start_accuracy'],
             after_cold_start_macro_f1=payload['after_cold_start_macro_f1'],
-            dataset_id=database.DatasetID.from_str(payload['dataset_id']),
+            dataset_id=database.DatasetID.from_str(payload['dataset_id'], data),
             pool_size=payload['pool_size'],
             seed=payload['seed'],
-            cs_strategy=strategies.ColdStartStrategy.from_str(payload['cs_strategy']),
-            al_strategy=strategies.ActiveLearningStrategy.from_str(payload['al_strategy']),
-            format_version=payload['format_version'],
+            cs_strategy=strategies.ColdStartStrategy.from_str(payload['cs_strategy'], data),
+            al_strategy=strategies.ActiveLearningStrategy.from_str(payload['al_strategy'], data),
             uuid=payload['uuid'],
             duration_cs=datetime.timedelta(milliseconds=payload['duration_cs']),
             duration_total=datetime.timedelta(milliseconds=payload['duration_total']),
         )
+        if migrated:
+            del data.stored_index[entry.id]
         data.encache(obj)
         return obj
 
@@ -129,15 +156,13 @@ class ExperimentHistory(Storable):
 def make_classifier_factory(
     transformer_model_name: str, num_classes: int, train_batch_size: int, num_epochs: int = 3
 ) -> TransformerBasedClassificationFactory:
-    import torch
-
     model_args = TransformerModelArguments(transformer_model_name)
 
     clf_factory = TransformerBasedClassificationFactory(
         model_args,
         num_classes,
         classification_kwargs=dict(
-            device='cpu',  # "mps" if torch.mps.is_available() else "cpu",
+            device='cpu',
             num_epochs=num_epochs,
             mini_batch_size=train_batch_size,
         ),
@@ -147,6 +172,8 @@ def make_classifier_factory(
 
 @Storable.make_storable(StorableType.EXPERIMENT)
 class Experiment(Storable):
+    CURRENT_VERSION = 1
+
     def __init__(  # TODO: add tags
         self,
         dataset: 'database.CompleteDataset',
@@ -233,6 +260,7 @@ class Experiment(Storable):
                         'active_learning_strategy': str(self.active_learning_strategy),
                         'runs': self.runs,
                         'histories': {str(run): history.get_id() for run, history in self.histories.items()},
+                        'version': self.CURRENT_VERSION,
                     },
                     type=StorableType.EXPERIMENT,
                     id=self.get_id(),
@@ -244,19 +272,37 @@ class Experiment(Storable):
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < Experiment.CURRENT_VERSION:
+            return Experiment.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: StorableEntry, data: 'database.DataDatabase', storable_type: 'StorableType | None' = None
     ) -> Self:
         if entry.id in data and storable_type != StorableType.EXPERIMENT:
             return data.retrieve(entry.id)
-        payload = entry.payload
+        payload, migrated = Experiment.migrate_to_newest_version(entry.payload)
         obj = Experiment(
             dataset=data.retrieve(payload['dataset']),
             pool=data.retrieve(payload['pool']),
-            cold_start_strategy=strategies.ColdStartStrategy.from_str(payload['cold_start_strategy']),
-            active_learning_strategy=strategies.ActiveLearningStrategy.from_str(payload['active_learning_strategy']),
+            cold_start_strategy=strategies.ColdStartStrategy.from_str(payload['cold_start_strategy'], data),
+            active_learning_strategy=strategies.ActiveLearningStrategy.from_str(
+                payload['active_learning_strategy'], data
+            ),
         )
         obj.histories = {int(run): data.retrieve(history_id) for run, history_id in payload['histories'].items()}
+        if migrated:
+            del data.stored_index[entry.id]
         data.encache(obj)
         return obj
 
@@ -275,6 +321,9 @@ class Experiment(Storable):
         num_classes = len(np.unique(self.dataset.train.y))
         train_dataset = self.pool.to_transformers_dataset(tokenizer, num_classes)
         test_dataset = self.dataset.validation.to_transformers_dataset(tokenizer, num_classes)
+        self.active_learning_strategy.query_strategy.set_pool(self.pool)
+        self.cold_start_strategy.query_strategy.set_pool(self.pool)
+
         active_learner = PoolBasedActiveLearner(
             make_classifier_factory(
                 fine_tuning_model,
@@ -302,7 +351,7 @@ class Experiment(Storable):
         indices_labeled = np.array([], dtype=np.int64)
 
         # cold start cycle
-        print('[INFO]: Running cold start strategy...')
+        database.logger.info('Running cold start strategy...')
         acc_cs, macro_f1_cs, duration_cs, indices_labeled = self.cold_start_strategy.query_strategy.run_loop(
             self.pool,
             active_learner,
@@ -313,7 +362,7 @@ class Experiment(Storable):
         )
 
         # active learning cycle
-        print('[INFO]: Running active learning strategy...')
+        database.logger.info('Running active learning strategy...')
         acc_al, macro_f1_al, duration_al, indices_labeled = self.active_learning_strategy.query_strategy.run_loop(
             self.pool,
             active_learner,
@@ -362,6 +411,8 @@ class Experiment(Storable):
 
 @Storable.make_storable(StorableType.EXPERIMENTS)
 class Experiments(Storable):
+    CURRENT_VERSION = 1
+
     @dataclasses.dataclass(frozen=True, eq=True)
     class ExperimentKey:
         dataset_id: 'database.DatasetID'
@@ -470,6 +521,7 @@ class Experiments(Storable):
                 self.get_id(): StorableEntry(
                     payload={
                         'experiments': [experiment.get_id() for experiment in self.experiments],
+                        'version': self.CURRENT_VERSION,
                     },
                     type=StorableType.EXPERIMENTS,
                 ),
@@ -478,12 +530,29 @@ class Experiments(Storable):
         )
 
     @staticmethod
+    def migrate_payload_from_unversioned(payload: dict) -> dict:
+        new_payload = deepcopy(payload)
+        if 'version' not in payload:
+            new_payload['version'] = 1
+
+        return new_payload
+
+    @staticmethod
+    def migrate_to_newest_version(payload: dict) -> tuple[dict, bool]:
+        if payload.get('version', 0) < Experiments.CURRENT_VERSION:
+            return Experiments.migrate_payload_from_unversioned(payload), True
+        return payload, False
+
+    @staticmethod
     def from_storable(
         entry: StorableEntry, data: 'database.DataDatabase', storable_type: 'StorableType | None' = None
     ) -> Self:
         if entry.id in data and storable_type != StorableType.EXPERIMENTS:
             return data.retrieve(entry.id)
-        return Experiments(*(data.retrieve(experiment_id) for experiment_id in entry.payload['experiments']))
+        payload, migrated = Experiments.migrate_to_newest_version(entry.payload)
+        if migrated:
+            del data.stored_index[entry.id]
+        return Experiments(*(data.retrieve(experiment_id) for experiment_id in payload['experiments']))
 
     def merge(self, other: 'Experiments') -> 'Experiments':
         self.__experiments_map.update(other.__experiments_map)
@@ -526,6 +595,8 @@ class Experiments(Storable):
         bugdets: list[int],
         splits: list[int],
         al_batch_size: int,
+        *,
+        cs_batch_size: int | None = None,
         runs: int | Iterable[int] | None = None,
     ) -> 'Experiments':
         return Experiments(
@@ -537,7 +608,11 @@ class Experiments(Storable):
                             database, StorableType.SEEDED_INDICES, pool_size, seed, dataset.len_train
                         )
                     ),
-                    cold_start_strategy=strategies.ColdStartStrategy(cs_strategy_type, batch_size=split),
+                    cold_start_strategy=(
+                        strategies.ColdStartStrategy(cs_strategy_type, batch_size=split)
+                        if cs_batch_size is None
+                        else strategies.ColdStartStrategy(cs_strategy_type, batch_size=cs_batch_size, budget=split)
+                    ),
                     active_learning_strategy=strategies.ActiveLearningStrategy(
                         al_strategy_type, al_batch_size, budget - split
                     ),

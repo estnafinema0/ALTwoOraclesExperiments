@@ -2,6 +2,8 @@ from database import *
 from experiments import *
 from strategies import *
 from aggregation import *
+from local_secrets import *
+from local_logger import *
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -11,9 +13,11 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from small_text.utils.annotations import ExperimentalWarning
 from transformers import AutoTokenizer
 from transformers.utils.logging import disable_progress_bar
+from huggingface_hub import login
 
 import pathlib
 from types import MethodType
+import argparse
 
 
 def ensure_interactive_plot_backend():
@@ -38,23 +42,51 @@ def ensure_interactive_plot_backend():
 
 
 def main() -> int | None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--allow-llm',
+        action='store_true',
+        help='Enable LLM-backed strategies and API calls.',
+    )
+    args = parser.parse_args()
+
     warnings.filterwarnings('ignore', category=ExperimentalWarning)
     warnings.filterwarnings('ignore', category=UserWarning)
     disable_progress_bar()
 
     ensure_interactive_plot_backend()
 
-    # with DataDatabase(pathlib.Path.cwd().parent) as db:
-    #     # db.try_restore()
+    try:
+        secrets = Secrets.load_secrets(pathlib.Path.cwd().parent)
+        loaded_secrets = True
+    except FileNotFoundError:
+        print('Failed to load secrets')
+        loaded_secrets = False
+
+    if loaded_secrets:
+        login(secrets.hf_token)
+
+    logger = Logger(verbose_console=False, log_file=pathlib.Path.cwd().parent / "log.txt")
+
+    if args.allow_llm:
+        llms.enable()
+
+    # with DataDatabase(pathlib.Path.cwd().parent, logger=logger) as db:
+    #     db.try_restore()
     #     # db.recollect_stored()
     #     db.unroll()
-
+        
     # return
 
-    with DataDatabase(pathlib.Path.cwd().parent) as db:
+    with DataDatabase(pathlib.Path.cwd().parent, logger=logger) as db:
         db.try_restore()
         ag_news = db.get_dataset(DatasetID('ag_news'), cache=True)
         sst_2 = db.get_dataset(DatasetID('glue', 'sst2'), text_field='sentence', cache=True)
+
+        if loaded_secrets:
+            db.connect_llm(llms.LLMType.GIGACHAT, llms.GigachatLLM.connect(secrets.gigachat_api_key))
+        else:
+            logger.warn(f'Failed to connect {llms.LLMType.GIGACHAT}')
 
         from_product = Experiments.from_product(
             database=db,
@@ -83,11 +115,56 @@ def main() -> int | None:
                 splits=list(range(10, 300 + 1, 10)),
                 runs=3,
             ),
+            # (
+            #     Experiments.from_product(
+            #         database=db,
+            #         datasets=[sst_2, ag_news],
+            #         seeds=[42, 69, 1337, 1147, 1984],
+            #         pool_size=1000,
+            #         cold_start_strategies=[SelectLLMQueryStrategyType(llms.LLMType.GIGACHAT, db)],
+            #         active_learning_strategies=[QueryStrategySimple(SimpleQueryStrategyType.LEAST_CONFIDENCE)],
+            #         al_batch_size=10,
+            #         bugdets=[500],
+            #         splits=list(range(10, 300 + 1, 10)),
+            #         runs=3,
+            #     )
+            #     if loaded_secrets
+            #     else Experiments()
+            # ),
+            (
+                Experiments.from_product(
+                    database=db,
+                    datasets=[ag_news, sst_2],
+                    seeds=[42, 69, 1337, 1147, 1984],
+                    pool_size=1000,
+                    cold_start_strategies=[ActiveLLMQueryStrategyType(llms.LLMType.GIGACHAT, db)],
+                    active_learning_strategies=[QueryStrategySimple(SimpleQueryStrategyType.LEAST_CONFIDENCE)],
+                    al_batch_size=10,
+                    cs_batch_size=10,
+                    bugdets=[500],
+                    splits=list(range(10, 300 + 1, 10)),
+                    runs=3,
+                )
+                if loaded_secrets
+                else Experiments()
+            ),
+            # Experiments.from_product(
+            #     database=db,
+            #     datasets=[ag_news, sst_2],
+            #     seeds=[42, 69, 1337, 1147, 1984],
+            #     pool_size=1000,
+            #     cold_start_strategies=[DiversityInitQueryStrategyType()],
+            #     active_learning_strategies=[QueryStrategySimple(SimpleQueryStrategyType.LEAST_CONFIDENCE)],
+            #     al_batch_size=10,
+            #     bugdets=[500],
+            #     splits=list(range(10, 300 + 1, 10)),
+            #     runs=3,
+            # ),
         )
 
         experiments.sort_by(
             first=('seed', 'dataset'),
-            last=({'attr': 'split', 'reverse': True}, {'attr': 'active_learning_strategy', 'reverse': True}),
+            last=({'attr': 'split', 'reverse': False}, {'attr': 'active_learning_strategy', 'reverse': True}),
         )
 
         tokenizer = AutoTokenizer.from_pretrained('google/bert_uncased_L-2_H-128_A-2')
@@ -123,9 +200,7 @@ def main() -> int | None:
             info.order_at = number
 
         def log_run(exp: Experiment, run: int):
-            print(
-                f'[INFO]: RUNNING EXPERIMENT [{info.at}#{info.order_at}({run})/{info.total}/{len(experiments)}]: {exp}'
-            )
+            logger.info(f'RUNNING EXPERIMENT [{info.at}#{info.order_at}({run})/{info.total}/{len(experiments)}]: {exp}')
 
         experiments.run_all(
             tokenizer,
